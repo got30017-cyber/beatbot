@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# JSON data files (persisted on Railway volume, not in git)
+users.json
+battles.json
+queue.json
+finals.json
+settings.json
