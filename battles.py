@@ -571,6 +571,19 @@ def _send_beat(message):
 
     u = users[user_id]
 
+    # Проверка "уже в очереди" должна идти раньше лимита/монет — иначе юзер,
+    # потративший последние монеты на бит в очереди, не сможет добраться до
+    # кнопки отмены (а значит и до возврата монет), упираясь в "не хватает монет".
+    queue = load_queue()
+    if user_in_queue(user_id, queue):
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton("❌ Отменить бит", callback_data="cancel_beat"),
+            telebot.types.InlineKeyboardButton("🔙 Назад",        callback_data="cancel_ignore"),
+        )
+        _bot.send_message(message.chat.id, "⏳ Твой бит уже в очереди.\n\nХочешь отменить?", reply_markup=markup)
+        return
+
     exhausted, _ = check_daily_limit(u)
     save_users(users)
     if exhausted:
@@ -594,16 +607,6 @@ def _send_beat(message):
             f"Голосуй в батлах — каждый голос даёт +1 монету.\nНажми 🗳 Голосовать",
             reply_markup=get_menu(user_id),
         )
-        return
-
-    queue = load_queue()
-    if user_in_queue(user_id, queue):
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton("❌ Отменить бит", callback_data="cancel_beat"),
-            telebot.types.InlineKeyboardButton("🔙 Назад",        callback_data="cancel_ignore"),
-        )
-        _bot.send_message(message.chat.id, "⏳ Твой бит уже в очереди.\n\nХочешь отменить?", reply_markup=markup)
         return
 
     # Одна комната на старте — сразу просим аудиофайл, без шага выбора жанра
