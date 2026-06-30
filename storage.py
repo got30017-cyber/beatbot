@@ -8,6 +8,7 @@ from config import (
     BASE_DIR, DB_FILE,
     ROOMS, ROOM_LABELS, COINS_MAX, DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
     BEAT_COST_FREE, BEAT_COST_PRO,
+    FEEDBACK_CATEGORIES, RATING_POINTS,
 )
 
 # ─── Легаси JSON-файлы (только для одноразовой миграции) ──
@@ -39,6 +40,17 @@ def _ensure_user_columns(conn: sqlite3.Connection):
     for col, decl in new_columns.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+
+
+def _ensure_battle_columns(conn: sqlite3.Connection):
+    """Добавляет новые колонки battles в БД, созданную до их появления."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(battles)").fetchall()}
+    new_columns = {
+        "feedback": "TEXT DEFAULT '{}'",
+    }
+    for col, decl in new_columns.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE battles ADD COLUMN {col} {decl}")
 
 
 # ─── Инициализация БД ────────────────────────
@@ -82,9 +94,11 @@ def init_db():
                     start_time          TEXT,
                     end_time            TEXT,
                     counted_for_final   INTEGER DEFAULT 0,
-                    included_in_final   TEXT
+                    included_in_final   TEXT,
+                    feedback            TEXT DEFAULT '{}'
                 )
             """)
+            _ensure_battle_columns(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS queue (
                     user_id  TEXT PRIMARY KEY,
@@ -255,6 +269,7 @@ def load_battles() -> dict:
             "end_time":          row["end_time"],
             "counted_for_final": bool(row["counted_for_final"]),
             "included_in_final": row["included_in_final"],
+            "feedback":          json.loads(row["feedback"] or "{}"),
         }
         for row in rows
     }
@@ -269,8 +284,8 @@ def save_battles(battles: dict):
                 """INSERT INTO battles
                    (id, player1, player2, beat1_file_id, beat2_file_id,
                     votes1, votes2, voters, status, room, start_time, end_time,
-                    counted_for_final, included_in_final)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    counted_for_final, included_in_final, feedback)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         bid,
@@ -287,6 +302,7 @@ def save_battles(battles: dict):
                         b.get("end_time"),
                         int(bool(b.get("counted_for_final"))),
                         b.get("included_in_final"),
+                        json.dumps(b.get("feedback", {}), ensure_ascii=False),
                     )
                     for bid, b in battles.items()
                 ],
@@ -443,6 +459,50 @@ def get_badge(wins: int, final_wins: int) -> str:
     return "⚙️ Железо"
 
 
+def _battle_scores(b: dict) -> tuple:
+    """Суммарный балл по структурированным оценкам для каждой стороны битвы.
+
+    Старые батлы (до структурированной оценки) не имеют feedback — для них
+    используем votes1/votes2, чтобы не переписывать задним числом уже
+    подсчитанную историю побед/финалов.
+    """
+    feedback = b.get("feedback") or {}
+    if not feedback:
+        return b.get("votes1", 0), b.get("votes2", 0)
+
+    score1 = score2 = 0
+    for entry in feedback.values():
+        side1 = entry.get("1")
+        if side1:
+            score1 += sum(RATING_POINTS.get(v, 0) for v in side1.values())
+        side2 = entry.get("2")
+        if side2:
+            score2 += sum(RATING_POINTS.get(v, 0) for v in side2.values())
+    return score1, score2
+
+
+def _category_mode_summary(b: dict, side: str):
+    """Самая частая оценка по каждой категории для битов стороны side.
+
+    Возвращает None, если оценок меньше двух — недостаточно для сводки.
+    """
+    feedback = b.get("feedback") or {}
+    entries  = [entry[side] for entry in feedback.values() if side in entry]
+    if len(entries) < 2:
+        return None
+
+    summary = {}
+    for cat_key, _ in FEEDBACK_CATEGORIES:
+        counts = {}
+        for e in entries:
+            r = e.get(cat_key)
+            if r:
+                counts[r] = counts.get(r, 0) + 1
+        if counts:
+            summary[cat_key] = max(counts, key=counts.get)
+    return summary
+
+
 def get_room_wins(uid_str: str, battles: dict) -> dict:
     wins = {r: 0 for r in ROOMS}
     for b in battles.values():
@@ -451,10 +511,10 @@ def get_room_wins(uid_str: str, battles: dict) -> dict:
         room = b.get("room")
         if not room or room not in wins:
             continue
-        v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
-        if v1 > v2 and b.get("player1") == uid_str:
+        s1, s2 = _battle_scores(b)
+        if s1 > s2 and b.get("player1") == uid_str:
             wins[room] += 1
-        elif v2 > v1 and b.get("player2") == uid_str:
+        elif s2 > s1 and b.get("player2") == uid_str:
             wins[room] += 1
     return wins
 

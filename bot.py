@@ -10,6 +10,7 @@ from config import (
     DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
     BATTLE_HOURS, FINAL_HOURS,
     MESSAGE_DAILY_LIMIT, MESSAGE_COOLDOWN_MINUTES,
+    FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
     _settings,
     get_battle_hours, get_final_hours, get_final_threshold,
 )
@@ -22,6 +23,7 @@ from storage import (
     get_menu,
     load_settings, save_settings,
     init_db, migrate_from_json,
+    _battle_scores, _category_mode_summary,
 )
 import battles
 import finals
@@ -155,6 +157,50 @@ def save_nickname(message):
 
 # ─── Профиль ──────────────────────────────────
 
+_POINTS_TO_LABEL = {v: k for k, v in RATING_POINTS.items()}
+
+
+def _profile_average_ratings(user_id: str, battles_data: dict):
+    """Средние оценки по категориям для битов юзера — None, если оцененных битов < 3."""
+    totals = {cat_key: 0 for cat_key, _ in FEEDBACK_CATEGORIES}
+    counts = {cat_key: 0 for cat_key, _ in FEEDBACK_CATEGORIES}
+    rated_battles = 0
+
+    for b in battles_data.values():
+        if b.get("status") != "finished":
+            continue
+        if b.get("player1") == user_id:
+            side = "1"
+        elif b.get("player2") == user_id:
+            side = "2"
+        else:
+            continue
+
+        feedback = b.get("feedback") or {}
+        entries  = [entry[side] for entry in feedback.values() if side in entry]
+        if not entries:
+            continue
+
+        rated_battles += 1
+        for cat_key, _ in FEEDBACK_CATEGORIES:
+            for e in entries:
+                r = e.get(cat_key)
+                if r:
+                    totals[cat_key] += RATING_POINTS.get(r, 0)
+                    counts[cat_key] += 1
+
+    if rated_battles < 3:
+        return None
+
+    result = {}
+    for cat_key, _ in FEEDBACK_CATEGORIES:
+        if counts[cat_key] == 0:
+            continue
+        avg = round(totals[cat_key] / counts[cat_key])
+        result[cat_key] = _POINTS_TO_LABEL[max(0, min(2, avg))]
+    return result
+
+
 def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> str:
     u       = users[user_id]
     badge   = get_badge(u.get("wins", 0), u.get("final_wins", 0))
@@ -182,6 +228,18 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
     if best_wins > 0:
         lines.append(f"🎯 Лучшая комната: {ROOM_LABELS[best_room]} ({best_wins} побед)")
     lines.append(f"⚔️ Батлов сегодня осталось: {battles_left}")
+
+    avg_ratings = _profile_average_ratings(user_id, battles_data)
+    if avg_ratings:
+        parts = []
+        for cat_key, cat_label in FEEDBACK_CATEGORIES:
+            label = avg_ratings.get(cat_key)
+            if label:
+                emoji = cat_label.split()[0]
+                parts.append(f"{emoji} {RATING_LABELS[label]}")
+        if parts:
+            lines.append(f"📊 Средние оценки: {' · '.join(parts)}")
+
     bio = u.get("bio", "").strip()
     if bio:
         lines.append(f"\n📝 {bio}")
@@ -367,10 +425,10 @@ def show_winners(message):
 
     winners_cards = []
     for bid, b in finished:
-        v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
-        if v1 > v2:
+        s1, s2 = _battle_scores(b)
+        if s1 > s2:
             winner_id = b["player1"]
-        elif v2 > v1:
+        elif s2 > s1:
             winner_id = b["player2"]
         else:
             continue
@@ -753,6 +811,7 @@ def _admin_stop_round() -> str:
 
     for bid, b in active.items():
         votes1, votes2 = b.get("votes1", 0), b.get("votes2", 0)
+        score1, score2 = _battle_scores(b)
         p1, p2         = b["player1"], b["player2"]
         p1_nick        = users.get(p1, {}).get("nickname", "Игрок 1")
         p2_nick        = users.get(p2, {}).get("nickname", "Игрок 2")
@@ -761,9 +820,9 @@ def _admin_stop_round() -> str:
         b["status"]   = "finished"
         b["end_time"] = datetime.now().isoformat()
 
-        if votes1 > votes2:
+        if score1 > score2:
             winner_id, winning_side = p1, 1
-        elif votes2 > votes1:
+        elif score2 > score1:
             winner_id, winning_side = p2, 2
         else:
             winner_id, winning_side = None, 0
@@ -775,12 +834,16 @@ def _admin_stop_round() -> str:
             if room:
                 rooms_to_check.add(room)
 
-        for uid_str, voted_side in b.get("voters", {}).items():
+        for uid_str, entry in b.get("feedback", {}).items():
             if uid_str not in users:
                 continue
+            user_score1  = sum(RATING_POINTS.get(v, 0) for v in entry.get("1", {}).values())
+            user_score2  = sum(RATING_POINTS.get(v, 0) for v in entry.get("2", {}).values())
+            implied_side = 1 if user_score1 > user_score2 else 2 if user_score2 > user_score1 else 0
+
             u = users[uid_str]
             u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
-            if winning_side and voted_side == winning_side:
+            if winning_side and implied_side == winning_side:
                 u["rating"] = u.get("rating", 0) + 1
 
         try:
@@ -788,9 +851,12 @@ def _admin_stop_round() -> str:
         except Exception:
             pass
 
-        for pid, nick, votes, opp_nick, opp_votes in [
-            (p1, p1_nick, votes1, p2_nick, votes2),
-            (p2, p2_nick, votes2, p1_nick, votes1),
+        summary1 = battles._feedback_summary_text(b, "1")
+        summary2 = battles._feedback_summary_text(b, "2")
+
+        for pid, nick, votes, opp_nick, opp_votes, summary in [
+            (p1, p1_nick, votes1, p2_nick, votes2, summary1),
+            (p2, p2_nick, votes2, p1_nick, votes1, summary2),
         ]:
             try:
                 if winner_id is None:
@@ -802,7 +868,8 @@ def _admin_stop_round() -> str:
                 bot.send_message(
                     pid,
                     f"🛑 Батл #{bid} остановлен администратором.\n\n"
-                    f"{nick} — {votes} голосов\n{opp_nick} — {opp_votes} голосов\n\n{result_text}",
+                    f"{nick} — {votes} голосов\n{opp_nick} — {opp_votes} голосов\n\n{result_text}"
+                    + (f"\n\n{summary}" if summary else ""),
                 )
             except Exception:
                 pass
@@ -826,6 +893,8 @@ def _admin_stop_round() -> str:
     battles.vote_session.clear()
     battles.vote_context.clear()
     battles.vote_unlocked_at.clear()
+    battles.pending_feedback.clear()
+    battles._first_side_shown.clear()
 
     save_battles(battles_data)
     save_users(users)

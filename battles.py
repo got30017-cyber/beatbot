@@ -6,6 +6,7 @@ from config import (
     ADMIN_ID, ROOMS, ROOM_LABELS,
     COINS_MAX, BEAT_COST_FREE, BEAT_COST_PRO,
     NOTIFY_THROTTLE_HOURS,
+    FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
     _settings, get_battle_hours,
 )
 from storage import (
@@ -14,19 +15,23 @@ from storage import (
     load_queue, save_queue,
     _empty_queue,
     check_daily_limit, user_in_queue, get_menu,
+    _battle_scores, _category_mode_summary,
 )
 from finals import check_and_start_final
 
 _bot: telebot.TeleBot = None
 _scheduler = None
 
-VOTE_UNLOCK_DELAY  = 20   # сек. — кнопки голосования появляются не раньше
-VOTE_GRACE_PERIOD  = 5    # сек. — голос засчитывается не раньше, чем через это время после разблокировки
+VOTE_UNLOCK_DELAY  = 20   # сек. — карточка оценки появляется не раньше
+VOTE_GRACE_PERIOD  = 5    # сек. — первая оценка засчитывается не раньше, чем через это время после разблокировки
 
 # Сессии голосования (видны из bot.py для сброса в admin_stop_round)
 vote_context: dict = {}        # user_id -> "beat" | "free" | "room_<uid>"
 vote_session: dict = {}        # user_id -> {"required": N, "battles": [...]}
-vote_unlocked_at: dict = {}    # user_id -> iso_timestamp, когда юзеру реально пришли кнопки голосования
+vote_unlocked_at: dict = {}    # user_id -> iso_timestamp, когда юзеру реально пришла первая карточка оценки
+
+_first_side_shown: dict = {}   # user_id -> "1"|"2", какой бит этому юзеру показан первым (для текущего батла)
+pending_feedback: dict = {}    # user_id -> {"bid","chat_id","message_id","first_side","current_side","ratings":{"1":{},"2":{}}}
 
 
 def init(bot: telebot.TeleBot, scheduler):
@@ -90,6 +95,18 @@ def find_user_battle(user_id: str):
     return finished[-1] if finished else (None, None)
 
 
+def _feedback_summary_text(b: dict, side: str):
+    summary = _category_mode_summary(b, side)
+    if not summary:
+        return None
+    lines = ["📊 Что говорят слушатели о твоём бите:\n"]
+    for cat_key, cat_label in FEEDBACK_CATEGORIES:
+        rating = summary.get(cat_key)
+        if rating:
+            lines.append(f"{cat_label}: {RATING_EMOJI[rating]} {RATING_LABELS[rating]}")
+    return "\n".join(lines)
+
+
 # ─── Завершение батла ─────────────────────────
 
 def finish_battle(bid: str):
@@ -106,29 +123,36 @@ def finish_battle(bid: str):
 
     votes1  = b.get("votes1", 0)
     votes2  = b.get("votes2", 0)
+    score1, score2 = _battle_scores(b)
     p1, p2  = b["player1"], b["player2"]
     p1_nick = users.get(p1, {}).get("nickname", "Игрок 1")
     p2_nick = users.get(p2, {}).get("nickname", "Игрок 2")
 
-    if votes1 > votes2:
+    if score1 > score2:
         winning_side                 = 1
         winner_id, loser_id          = p1, p2
         winner_nick, loser_nick      = p1_nick, p2_nick
         winner_votes, loser_votes    = votes1, votes2
-    elif votes2 > votes1:
+        winner_side, loser_side      = "1", "2"
+    elif score2 > score1:
         winning_side                 = 2
         winner_id, loser_id          = p2, p1
         winner_nick, loser_nick      = p2_nick, p1_nick
         winner_votes, loser_votes    = votes2, votes1
+        winner_side, loser_side      = "2", "1"
     else:
         winning_side = 0
 
-    for uid_str, voted_side in b.get("voters", {}).items():
+    for uid_str, entry in b.get("feedback", {}).items():
         if uid_str not in users:
             continue
+        user_score1 = sum(RATING_POINTS.get(v, 0) for v in entry.get("1", {}).values())
+        user_score2 = sum(RATING_POINTS.get(v, 0) for v in entry.get("2", {}).values())
+        implied_side = 1 if user_score1 > user_score2 else 2 if user_score2 > user_score1 else 0
+
         u = users[uid_str]
         u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
-        if winning_side != 0 and voted_side == winning_side:
+        if winning_side != 0 and implied_side == winning_side:
             u["rating"] = u.get("rating", 0) + 1
 
     if winning_side == 0:
@@ -164,6 +188,9 @@ def finish_battle(bid: str):
     loser_pct  = 100 - winner_pct
     new_rating = users.get(winner_id, {}).get("rating", 0)
 
+    winner_summary = _feedback_summary_text(b, winner_side)
+    loser_summary  = _feedback_summary_text(b, loser_side)
+
     try:
         _bot.send_message(
             winner_id,
@@ -172,7 +199,8 @@ def finish_battle(bid: str):
             f"🎵 {winner_nick} — {winner_votes} гол. ({winner_pct}%)\n"
             f"🎵 {loser_nick} — {loser_votes} гол. ({loser_pct}%)\n\n"
             f"📊 Всего голосов: {total}\n"
-            f"⭐️ Твой рейтинг: {new_rating} (+10)",
+            f"⭐️ Твой рейтинг: {new_rating} (+10)"
+            + (f"\n\n{winner_summary}" if winner_summary else ""),
         )
     except Exception:
         pass
@@ -183,7 +211,8 @@ def finish_battle(bid: str):
             f"❌ Ты проиграл.\n"
             f"🎵 {winner_nick} — {winner_votes} гол. ({winner_pct}%)\n"
             f"🎵 {loser_nick} — {loser_votes} гол. ({loser_pct}%)\n\n"
-            f"📊 Всего голосов: {total}",
+            f"📊 Всего голосов: {total}"
+            + (f"\n\n{loser_summary}" if loser_summary else ""),
         )
     except Exception:
         pass
@@ -248,6 +277,7 @@ def send_battle_for_vote(chat_id, bid, battles):
 
     order = [1, 2]
     random.shuffle(order)   # порядок прослушивания рандомный для каждого голосующего
+    _first_side_shown[str(chat_id)] = str(order[0])
 
     for position, side in enumerate(order):
         file_id = b.get(f"beat{side}_file_id")
@@ -289,20 +319,199 @@ def _unlock_vote_buttons(chat_id, bid):
         return
 
     user_id = str(chat_id)
-    if user_id in b.get("voters", {}):
+    if user_id in b.get("feedback", {}):
         return
 
-    markup = telebot.types.InlineKeyboardMarkup()
-    markup.row(
-        telebot.types.InlineKeyboardButton("🔥 Бит 1", callback_data=f"vote_{bid}_1"),
-        telebot.types.InlineKeyboardButton("🔥 Бит 2", callback_data=f"vote_{bid}_2"),
-    )
+    first_side = _first_side_shown.get(user_id, "1")
+    pending_feedback[user_id] = {
+        "bid":          bid,
+        "chat_id":      chat_id,
+        "message_id":   None,
+        "first_side":   first_side,
+        "current_side": first_side,
+        "ratings":      {"1": {}, "2": {}},
+    }
+
     try:
-        _bot.send_message(chat_id, "✅ Теперь можешь голосовать 👇", reply_markup=markup)
+        _bot.send_message(chat_id, "✅ Теперь можешь оценить биты 👇")
+        _send_feedback_card(user_id)
     except Exception:
         return
 
     vote_unlocked_at[user_id] = datetime.now().isoformat()
+
+
+# ─── Карточки структурированной оценки ───────
+
+def _render_feedback_card(bid: str, side: str, ratings: dict):
+    lines = [f"🎵 Оцени Бит {side}:"]
+    rows  = []
+    for cat_key, cat_label in FEEDBACK_CATEGORIES:
+        if cat_key in ratings:
+            chosen = ratings[cat_key]
+            lines.append(f"✅ {cat_label}: {RATING_EMOJI[chosen]} {RATING_LABELS[chosen]}")
+        else:
+            lines.append(cat_label)
+            rows.append(cat_key)
+
+    markup = None
+    if rows:
+        markup = telebot.types.InlineKeyboardMarkup(row_width=3)
+        for cat_key in rows:
+            markup.row(*[
+                telebot.types.InlineKeyboardButton(
+                    RATING_LABELS[r], callback_data=f"fb_{bid}_{side}_{cat_key}_{r}",
+                )
+                for r in ("weak", "ok", "fire")
+            ])
+        markup.add(telebot.types.InlineKeyboardButton(
+            "💬 Добавить комментарий (необязательно)", callback_data=f"fbcomment_{bid}",
+        ))
+    return "\n".join(lines), markup
+
+
+def _send_feedback_card(user_id: str):
+    pending = pending_feedback.get(user_id)
+    if not pending:
+        return
+    bid  = pending["bid"]
+    side = pending["current_side"]
+
+    text, markup = _render_feedback_card(bid, side, pending["ratings"][side])
+    sent = _bot.send_message(pending["chat_id"], text, reply_markup=markup)
+    pending["message_id"] = sent.message_id
+
+
+def _handle_feedback_rating(call):
+    parts    = call.data.split("_")
+    rating   = parts[-1]
+    category = parts[-2]
+    side     = parts[-3]
+    bid      = "_".join(parts[1:-3])
+    user_id  = str(call.from_user.id)
+
+    pending = pending_feedback.get(user_id)
+    if not pending or pending["bid"] != bid or pending["current_side"] != side:
+        _bot.answer_callback_query(call.id, "Эта карточка уже неактуальна.")
+        return
+    if category not in dict(FEEDBACK_CATEGORIES) or rating not in RATING_POINTS:
+        _bot.answer_callback_query(call.id, "Неизвестная категория или оценка.")
+        return
+
+    ratings_for_side = pending["ratings"][side]
+    if category in ratings_for_side:
+        _bot.answer_callback_query(call.id, "Эта категория уже оценена.")
+        return
+
+    total_recorded = len(pending["ratings"]["1"]) + len(pending["ratings"]["2"])
+    if total_recorded == 0:
+        unlocked_at_str = vote_unlocked_at.get(user_id)
+        if unlocked_at_str:
+            unlocked_at = datetime.fromisoformat(unlocked_at_str)
+            if (datetime.now() - unlocked_at).total_seconds() < VOTE_GRACE_PERIOD:
+                _bot.answer_callback_query(call.id, "Подожди немного — дай биту доиграть 🎧")
+                return
+        vote_unlocked_at.pop(user_id, None)
+
+    ratings_for_side[category] = rating
+    _bot.answer_callback_query(call.id, f"{RATING_EMOJI[rating]} {RATING_LABELS[rating]}")
+
+    text, markup = _render_feedback_card(bid, side, ratings_for_side)
+    try:
+        _bot.edit_message_text(text, pending["chat_id"], pending["message_id"], reply_markup=markup)
+    except Exception:
+        pass
+
+    if len(ratings_for_side) < len(FEEDBACK_CATEGORIES):
+        return   # ждём остальные категории для этого бита
+
+    other_side = "2" if side == "1" else "1"
+    if side == pending["first_side"] and not pending["ratings"][other_side]:
+        pending["current_side"] = other_side
+        _send_feedback_card(user_id)
+        return
+
+    _finalize_feedback_vote(user_id)
+
+
+def _handle_feedback_comment_btn(call):
+    bid     = call.data[len("fbcomment_"):]
+    user_id = str(call.from_user.id)
+    pending = pending_feedback.get(user_id)
+    if not pending or pending["bid"] != bid:
+        _bot.answer_callback_query(call.id, "Эта карточка уже неактуальна.")
+        return
+    _bot.answer_callback_query(call.id)
+    _bot.send_message(call.message.chat.id, "💬 Напиши короткий комментарий для автора бита:")
+    _bot.register_next_step_handler(call.message, _receive_feedback_comment, user_id, bid)
+
+
+def _receive_feedback_comment(message, user_id: str, bid: str):
+    pending = pending_feedback.get(user_id)
+    if not pending or pending["bid"] != bid:
+        return
+    if not message.text:
+        _bot.send_message(message.chat.id, "Комментарий не сохранён — отправь текстом.")
+        return
+    pending["comment"] = message.text.strip()[:300]
+    _bot.send_message(message.chat.id, "✅ Комментарий сохранён, увидит автор бита после батла.")
+
+
+def _finalize_feedback_vote(user_id: str):
+    pending = pending_feedback.pop(user_id, None)
+    if not pending:
+        return
+    bid = pending["bid"]
+
+    battles = load_battles()
+    users   = load_users()
+    b = battles.get(bid)
+    if not b or b["status"] != "active":
+        return
+    if user_id not in users:
+        return
+    if bid in users[user_id].get("votes_this_round", []):
+        return
+
+    if "feedback" not in b:
+        b["feedback"] = {}
+    entry = {"1": pending["ratings"]["1"], "2": pending["ratings"]["2"]}
+    if pending.get("comment"):
+        entry["comment"] = pending["comment"]
+    b["feedback"][user_id] = entry
+
+    b["votes1"] = b.get("votes1", 0) + 1
+    b["votes2"] = b.get("votes2", 0) + 1
+
+    save_battles(battles)
+
+    if "votes_this_round" not in users[user_id]:
+        users[user_id]["votes_this_round"] = []
+    users[user_id]["votes_this_round"].append(bid)
+    save_users(users)
+
+    chat_id = pending["chat_id"]
+    p1_nick = users.get(b["player1"], {}).get("nickname", "Игрок 1")
+    p2_nick = users.get(b["player2"], {}).get("nickname", "Игрок 2")
+    _bot.send_message(
+        chat_id,
+        f"✅ Спасибо за оценку!\n\n👤 Бит 1 — {p1_nick}\n👤 Бит 2 — {p2_nick}\n\n"
+        f"+1 монета засчитается после завершения батла. Угадал победителя — будет ещё +1 рейтинг.",
+    )
+
+    required, already_voted, not_voted = votes_needed(user_id)
+    if not not_voted or already_voted >= required:
+        ctx  = vote_context.pop(user_id, "free")
+        text = (
+            "✅ Отлично! Теперь можешь загрузить бит — нажми 🎵 Отправить бит"
+            if ctx == "beat"
+            else "✅ Проголосовал во всех доступных батлах!"
+        )
+        clear_vote_session(user_id)
+        _bot.send_message(chat_id, text, reply_markup=get_menu(user_id))
+    else:
+        _bot.send_message(chat_id, f"Осталось батлов: {required - already_voted}")
+        send_next_battle_for_vote(chat_id, user_id, not_voted)
 
 
 def send_next_battle_for_vote(chat_id, user_id, not_voted):
@@ -627,82 +836,6 @@ def _vote_menu(message):
     send_next_battle_for_vote(message.chat.id, user_id, not_voted)
 
 
-def _handle_vote(call):
-    parts     = call.data.split("_")
-    voted_for = int(parts[-1])
-    bid       = "_".join(parts[1:-1])
-    user_id   = str(call.from_user.id)
-
-    users   = load_users()
-    battles = load_battles()
-
-    if user_id not in users:
-        _bot.answer_callback_query(call.id, "Сначала зарегистрируйся!")
-        return
-    if bid in users[user_id].get("votes_this_round", []):
-        _bot.answer_callback_query(call.id, "Ты уже голосовал в этом батле!")
-        return
-
-    b = battles.get(bid)
-    if not b or b["status"] != "active":
-        _bot.answer_callback_query(call.id, "Этот батл уже завершён.")
-        return
-    if user_id in [b["player1"], b["player2"]]:
-        _bot.answer_callback_query(call.id, "Нельзя голосовать в своём батле!")
-        return
-
-    unlocked_at_str = vote_unlocked_at.get(user_id)
-    if unlocked_at_str:
-        unlocked_at = datetime.fromisoformat(unlocked_at_str)
-        if (datetime.now() - unlocked_at).total_seconds() < VOTE_GRACE_PERIOD:
-            _bot.answer_callback_query(call.id, "Подожди немного — дай биту доиграть 🎧")
-            return
-    # если unlocked_at отсутствует (например, бот перезапустился) — не блокируем голос
-
-    if voted_for == 1:
-        b["votes1"] = b.get("votes1", 0) + 1
-    else:
-        b["votes2"] = b.get("votes2", 0) + 1
-
-    if "voters" not in b:
-        b["voters"] = {}
-    b["voters"][user_id] = voted_for
-
-    save_battles(battles)
-
-    if "votes_this_round" not in users[user_id]:
-        users[user_id]["votes_this_round"] = []
-    users[user_id]["votes_this_round"].append(bid)
-    save_users(users)
-
-    vote_unlocked_at.pop(user_id, None)
-
-    _bot.answer_callback_query(call.id, "✅ Голос засчитан!")
-    _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-
-    p1_nick = users.get(b["player1"], {}).get("nickname", "Игрок 1")
-    p2_nick = users.get(b["player2"], {}).get("nickname", "Игрок 2")
-    _bot.send_message(
-        call.message.chat.id,
-        f"👤 Бит 1 — {p1_nick}\n👤 Бит 2 — {p2_nick}\n\n"
-        f"+1 монета засчитается после завершения батла. Угадал победителя — будет ещё +1 рейтинг.",
-    )
-
-    required, already_voted, not_voted = votes_needed(user_id)
-    if not not_voted or already_voted >= required:
-        ctx  = vote_context.pop(user_id, "free")
-        text = (
-            "✅ Отлично! Теперь можешь загрузить бит — нажми 🎵 Отправить бит"
-            if ctx == "beat"
-            else "✅ Проголосовал во всех доступных батлах!"
-        )
-        clear_vote_session(user_id)
-        _bot.send_message(call.message.chat.id, text, reply_markup=get_menu(user_id))
-    else:
-        _bot.send_message(call.message.chat.id, f"Осталось батлов: {required - already_voted}")
-        send_next_battle_for_vote(call.message.chat.id, user_id, not_voted)
-
-
 def _my_battle(message):
     user_id = str(message.from_user.id)
     users   = load_users()
@@ -763,5 +896,6 @@ def register_handlers(bot: telebot.TeleBot):
     bot.message_handler(content_types=["audio", "voice", "document"])(_receive_beat)
     bot.callback_query_handler(func=lambda c: c.data.startswith("room_"))(_handle_room_select)
     bot.callback_query_handler(func=lambda c: c.data in ["cancel_beat", "cancel_ignore"])(_handle_cancel_beat)
-    bot.callback_query_handler(func=lambda c: c.data.startswith("vote_"))(_handle_vote)
+    bot.callback_query_handler(func=lambda c: c.data.startswith("fbcomment_"))(_handle_feedback_comment_btn)
+    bot.callback_query_handler(func=lambda c: c.data.startswith("fb_"))(_handle_feedback_rating)
     bot.callback_query_handler(func=lambda c: c.data.startswith("report_"))(_handle_report)
