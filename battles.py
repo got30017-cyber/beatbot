@@ -1,3 +1,4 @@
+import random
 import telebot
 from datetime import datetime, timedelta
 
@@ -18,9 +19,13 @@ from finals import check_and_start_final
 _bot: telebot.TeleBot = None
 _scheduler = None
 
+VOTE_UNLOCK_DELAY  = 20   # сек. — кнопки голосования появляются не раньше
+VOTE_GRACE_PERIOD  = 5    # сек. — голос засчитывается не раньше, чем через это время после разблокировки
+
 # Сессии голосования (видны из bot.py для сброса в admin_stop_round)
-vote_context: dict = {}   # user_id -> "beat" | "free" | "room_<uid>"
-vote_session: dict = {}   # user_id -> {"required": N, "battles": [...]}
+vote_context: dict = {}        # user_id -> "beat" | "free" | "room_<uid>"
+vote_session: dict = {}        # user_id -> {"required": N, "battles": [...]}
+vote_unlocked_at: dict = {}    # user_id -> iso_timestamp, когда юзеру реально пришли кнопки голосования
 
 
 def init(bot: telebot.TeleBot, scheduler):
@@ -240,34 +245,63 @@ def send_battle_for_vote(chat_id, bid, battles):
     b          = battles[bid]
     room_label = ROOM_LABELS.get(b.get("room", ""), "")
 
-    markup1 = telebot.types.InlineKeyboardMarkup()
-    markup1.add(telebot.types.InlineKeyboardButton("⚠️ Пожаловаться", callback_data=f"report_{bid}_1"))
+    order = [1, 2]
+    random.shuffle(order)   # порядок прослушивания рандомный для каждого голосующего
 
-    markup2 = telebot.types.InlineKeyboardMarkup()
-    markup2.row(
+    for position, side in enumerate(order):
+        file_id = b.get(f"beat{side}_file_id")
+        markup  = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(
+            f"⚠️ Пожаловаться на бит {side}", callback_data=f"report_{bid}_{side}",
+        ))
+
+        if position == 0:
+            caption = f"🎵 Бит {side}"
+        else:
+            caption = (
+                f"🎵 Бит {side}\n\n⚔️ Батл #{bid} {room_label}\n"
+                f"Послушай оба бита — голосование откроется через {VOTE_UNLOCK_DELAY} секунд 👇"
+            )
+
+        if file_id:
+            try:
+                _bot.send_audio(chat_id, file_id, caption=caption, reply_markup=markup)
+            except Exception:
+                _bot.send_message(chat_id, caption, reply_markup=markup)
+        else:
+            _bot.send_message(chat_id, caption, reply_markup=markup)
+
+    _scheduler.add_job(
+        _unlock_vote_buttons,
+        "date",
+        run_date=datetime.now() + timedelta(seconds=VOTE_UNLOCK_DELAY),
+        args=[chat_id, bid],
+        id=f"unlock_{bid}_{chat_id}",
+        replace_existing=True,
+    )
+
+
+def _unlock_vote_buttons(chat_id, bid):
+    battles = load_battles()
+    b       = battles.get(bid)
+    if not b or b["status"] != "active":
+        return
+
+    user_id = str(chat_id)
+    if user_id in b.get("voters", {}):
+        return
+
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
         telebot.types.InlineKeyboardButton("🔥 Бит 1", callback_data=f"vote_{bid}_1"),
         telebot.types.InlineKeyboardButton("🔥 Бит 2", callback_data=f"vote_{bid}_2"),
     )
-    markup2.add(telebot.types.InlineKeyboardButton("⚠️ Пожаловаться на бит 2", callback_data=f"report_{bid}_2"))
+    try:
+        _bot.send_message(chat_id, "✅ Теперь можешь голосовать 👇", reply_markup=markup)
+    except Exception:
+        return
 
-    file1, file2 = b.get("beat1_file_id"), b.get("beat2_file_id")
-
-    if file1:
-        try:
-            _bot.send_audio(chat_id, file1, caption="🎵 Бит 1", reply_markup=markup1)
-        except Exception:
-            _bot.send_message(chat_id, "🎵 Бит 1", reply_markup=markup1)
-    else:
-        _bot.send_message(chat_id, "🎵 Бит 1", reply_markup=markup1)
-
-    caption = f"🎵 Бит 2\n\n⚔️ Батл #{bid} {room_label}\nПослушай оба бита и голосуй 👇"
-    if file2:
-        try:
-            _bot.send_audio(chat_id, file2, caption=caption, reply_markup=markup2)
-        except Exception:
-            _bot.send_message(chat_id, caption, reply_markup=markup2)
-    else:
-        _bot.send_message(chat_id, caption, reply_markup=markup2)
+    vote_unlocked_at[user_id] = datetime.now().isoformat()
 
 
 def send_next_battle_for_vote(chat_id, user_id, not_voted):
@@ -554,7 +588,8 @@ def _vote_menu(message):
     _bot.send_message(
         message.chat.id,
         f"🗳 Батлов для голосования: {len(not_voted)}\n\n"
-        f"Каждый голос → +1 монета! Угадаешь победителя — ещё и +1 рейтинг.\nИмена скрыты до твоего голоса. 👇",
+        f"Слушай оба бита внимательно — голосовать можно через {VOTE_UNLOCK_DELAY} секунд после получения битов.\n"
+        f"+1 монета за голос, угадал победителя — ещё и +1 рейтинг.\nИмена скрыты до твоего голоса. 👇",
     )
     send_next_battle_for_vote(message.chat.id, user_id, not_voted)
 
@@ -583,6 +618,14 @@ def _handle_vote(call):
         _bot.answer_callback_query(call.id, "Нельзя голосовать в своём батле!")
         return
 
+    unlocked_at_str = vote_unlocked_at.get(user_id)
+    if unlocked_at_str:
+        unlocked_at = datetime.fromisoformat(unlocked_at_str)
+        if (datetime.now() - unlocked_at).total_seconds() < VOTE_GRACE_PERIOD:
+            _bot.answer_callback_query(call.id, "Подожди немного — дай биту доиграть 🎧")
+            return
+    # если unlocked_at отсутствует (например, бот перезапустился) — не блокируем голос
+
     if voted_for == 1:
         b["votes1"] = b.get("votes1", 0) + 1
     else:
@@ -598,6 +641,8 @@ def _handle_vote(call):
         users[user_id]["votes_this_round"] = []
     users[user_id]["votes_this_round"].append(bid)
     save_users(users)
+
+    vote_unlocked_at.pop(user_id, None)
 
     _bot.answer_callback_query(call.id, "✅ Голос засчитан!")
     _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)

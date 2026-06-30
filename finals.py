@@ -1,3 +1,4 @@
+import random
 import telebot
 from datetime import datetime, timedelta
 
@@ -14,6 +15,12 @@ from storage import (
 
 _bot: telebot.TeleBot = None
 _scheduler = None
+
+VOTE_UNLOCK_DELAY = 20   # сек. — кнопка голосования появляется не раньше
+VOTE_GRACE_PERIOD = 5    # сек. — голос засчитывается не раньше, чем через это время после разблокировки
+
+vote_unlocked_at: dict = {}   # user_id -> iso_timestamp, когда юзеру реально пришла кнопка голосования
+_final_order: dict = {}       # (user_id, fid) -> рандомизированный для этого юзера порядок битов
 
 
 def init(bot: telebot.TeleBot, scheduler):
@@ -274,6 +281,13 @@ def _handle_final_view(call):
         f"Послушай все {len(f['beats'])} битов и проголосуй за лучший.\n"
         f"Один голос — одна попытка! Имена скрыты. 👇",
     )
+
+    order_key = (user_id, fid)
+    if order_key not in _final_order:
+        shuffled = list(f["beats"])
+        random.shuffle(shuffled)   # порядок прослушивания рандомный для каждого голосующего
+        _final_order[order_key] = shuffled
+
     _send_final_beat(call.message.chat.id, user_id, fid, 0)
 
 
@@ -283,7 +297,7 @@ def _send_final_beat(chat_id: int, user_id: str, fid: str, index: int):
     if not f:
         return
 
-    beats = f["beats"]
+    beats = _final_order.get((user_id, fid), f["beats"])
     total = len(beats)
 
     if index >= total:
@@ -300,30 +314,61 @@ def _send_final_beat(chat_id: int, user_id: str, fid: str, index: int):
         _send_final_beat(chat_id, user_id, fid, index + 1)
         return
 
-    markup   = telebot.types.InlineKeyboardMarkup()
-    btn_vote = telebot.types.InlineKeyboardButton(
-        "🔥 Голосовать за этот бит",
-        callback_data=f"fvote_{fid_num}_{owner_uid}",
-    )
+    markup = None
     if index + 1 < total:
-        btn_next = telebot.types.InlineKeyboardButton(
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton(
             f"▶️ Далее ({index + 2}/{total})",
             callback_data=f"fnext_{fid_num}_{index + 1}",
-        )
-        markup.row(btn_vote, btn_next)
-    else:
-        markup.add(btn_vote)
+        ))
 
     room_label = ROOM_LABELS.get(f.get("room", ""), "")
-    caption    = f"🎵 Бит {index + 1} из {total}\n🏆 Финал {room_label}"
+    caption    = (
+        f"🎵 Бит {index + 1} из {total}\n🏆 Финал {room_label}\n"
+        f"Голосовать за этот бит можно будет через {VOTE_UNLOCK_DELAY} секунд."
+    )
 
+    sent = False
     if file_id:
         try:
             _bot.send_audio(chat_id, file_id, caption=caption, reply_markup=markup)
-            return
+            sent = True
         except Exception:
             pass
-    _bot.send_message(chat_id, caption, reply_markup=markup)
+    if not sent:
+        _bot.send_message(chat_id, caption, reply_markup=markup)
+
+    _scheduler.add_job(
+        _unlock_final_vote,
+        "date",
+        run_date=datetime.now() + timedelta(seconds=VOTE_UNLOCK_DELAY),
+        args=[chat_id, fid, owner_uid],
+        id=f"funlock_{fid}_{owner_uid}_{chat_id}",
+        replace_existing=True,
+    )
+
+
+def _unlock_final_vote(chat_id, fid: str, owner_uid: str):
+    finals = load_finals()
+    f      = finals.get(fid)
+    if not f or f["status"] != "active":
+        return
+
+    user_id = str(chat_id)
+    if user_id in f.get("voters", []):
+        return
+
+    fid_num = fid.split("_")[1]
+    markup  = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(
+        "🔥 Голосовать за этот бит", callback_data=f"fvote_{fid_num}_{owner_uid}",
+    ))
+    try:
+        _bot.send_message(chat_id, "✅ Теперь можешь голосовать за этот трек 👇", reply_markup=markup)
+    except Exception:
+        return
+
+    vote_unlocked_at[user_id] = datetime.now().isoformat()
 
 
 def _handle_final_next(call):
@@ -373,6 +418,14 @@ def _handle_final_vote(call):
         _bot.answer_callback_query(call.id, "Участник не найден в финале.")
         return
 
+    unlocked_at_str = vote_unlocked_at.get(user_id)
+    if unlocked_at_str:
+        unlocked_at = datetime.fromisoformat(unlocked_at_str)
+        if (datetime.now() - unlocked_at).total_seconds() < VOTE_GRACE_PERIOD:
+            _bot.answer_callback_query(call.id, "Подожди немного — дай биту доиграть 🎧")
+            return
+    # если unlocked_at отсутствует (например, бот перезапустился) — не блокируем голос
+
     if "votes" not in f:
         f["votes"] = {}
     f["votes"][owner_uid] = f["votes"].get(owner_uid, 0) + 1
@@ -382,6 +435,7 @@ def _handle_final_vote(call):
     f["voters"].append(user_id)
 
     save_finals(finals)
+    vote_unlocked_at.pop(user_id, None)
 
     _bot.answer_callback_query(call.id, "✅ Голос засчитан!")
     _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)

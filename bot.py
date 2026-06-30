@@ -807,6 +807,7 @@ def _admin_stop_round() -> str:
     # Очищаем сессионные данные в battles
     battles.vote_session.clear()
     battles.vote_context.clear()
+    battles.vote_unlocked_at.clear()
 
     save_battles(battles_data)
     save_users(users)
