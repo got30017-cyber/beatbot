@@ -1,3 +1,4 @@
+import re
 import telebot
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -7,7 +8,7 @@ from config import (
     ROOMS, ROOM_LABELS,
     COINS_MAX, BEAT_COST_FREE, BEAT_COST_PRO,
     DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
-    _settings, load_settings, save_settings,
+    _settings,
     get_battle_hours, get_final_hours, get_final_threshold,
 )
 from storage import (
@@ -17,9 +18,15 @@ from storage import (
     load_queue, save_queue, _empty_queue,
     default_user, get_badge, get_room_wins,
     get_menu,
+    load_settings, save_settings,
+    init_db, migrate_from_json,
 )
 import battles
 import finals
+
+# ─── База данных ──────────────────────────────
+init_db()
+migrate_from_json()
 
 # ─── Создание экземпляров ────────────────────
 bot       = telebot.TeleBot(TOKEN)
@@ -35,6 +42,8 @@ finals.register_handlers(bot)
 # ─── Сессии ──────────────────────────────────
 msg_pending   = {}   # user_id -> target_user_id
 admin_session = {}   # admin_id -> target_uid (флоу начисления монет)
+
+_NICKNAME_RE = re.compile(r'^[\w ]+$', re.UNICODE)
 
 
 # ─── Онбординг и регистрация ─────────────────
@@ -55,7 +64,7 @@ _ONBOARD = [
     ),
     (
         "🪙 Монеты и рейтинг\n\n"
-        "• Голосуй в батлах → +1 монета за правильный голос\n"
+        "• Голосуй в батлах → +1 монета за каждый голос, +1 рейтинг если угадал победителя\n"
         "• Побеждай батлы → +10 к рейтингу\n"
         "• Выиграй финал → +100 к рейтингу и бейдж 👑 Легенда\n\n"
         "Готов начать? Создай профиль!"
@@ -101,9 +110,33 @@ def handle_onboard(call):
 
 
 def save_nickname(message):
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
+        bot.register_next_step_handler(message, save_nickname)
+        return
+
     nickname = message.text.strip()
-    users    = load_users()
-    user_id  = str(message.from_user.id)
+
+    if not (2 <= len(nickname) <= 20):
+        bot.send_message(message.chat.id, "❌ Никнейм должен быть от 2 до 20 символов. Попробуй ещё раз:")
+        bot.register_next_step_handler(message, save_nickname)
+        return
+
+    if not _NICKNAME_RE.fullmatch(nickname):
+        bot.send_message(
+            message.chat.id,
+            "❌ Никнейм может содержать только буквы, цифры, пробелы и подчёркивания. Попробуй ещё раз:",
+        )
+        bot.register_next_step_handler(message, save_nickname)
+        return
+
+    users   = load_users()
+    user_id = str(message.from_user.id)
+
+    if any(uid != user_id and u.get("nickname", "").lower() == nickname.lower() for uid, u in users.items()):
+        bot.send_message(message.chat.id, "❌ Этот никнейм уже занят. Попробуй другой:")
+        bot.register_next_step_handler(message, save_nickname)
+        return
 
     users[user_id] = default_user(nickname)
     save_users(users)
@@ -218,8 +251,11 @@ def handle_bio_edit(call):
 
 
 def _save_bio(message):
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
+        return
     user_id = str(message.from_user.id)
-    text    = (message.text or "").strip()
+    text    = message.text.strip()
     if len(text) > 150:
         bot.send_message(message.chat.id, f"❌ Слишком длинный текст ({len(text)} символов). Максимум 150.")
         return
@@ -406,6 +442,10 @@ def handle_write(call):
 
 
 def handle_outgoing_message(message):
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
+        return
+
     sender_uid = str(message.from_user.id)
     target_uid = msg_pending.pop(sender_uid, None)
 
@@ -413,7 +453,7 @@ def handle_outgoing_message(message):
         bot.send_message(message.chat.id, "Сессия устарела — попробуй снова.")
         return
 
-    text = (message.text or "").strip()
+    text = message.text.strip()
     if not text:
         bot.send_message(message.chat.id, "Пустое сообщение не отправлено.")
         return
@@ -576,6 +616,9 @@ def handle_admin_actions(call):
 def _admin_coins_step1(message):
     if message.from_user.id != ADMIN_ID:
         return
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
+        return
     uid   = message.text.strip()
     users = load_users()
     if uid not in users:
@@ -594,6 +637,9 @@ def _admin_coins_step1(message):
 
 def _admin_coins_step2(message):
     if message.from_user.id != ADMIN_ID:
+        return
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
         return
     admin_uid  = str(message.from_user.id)
     target_uid = admin_session.pop(admin_uid, None)
@@ -618,6 +664,9 @@ def _admin_coins_step2(message):
 def _admin_time_step1(message):
     if message.from_user.id != ADMIN_ID:
         return
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
+        return
     try:
         hours = int(message.text.strip())
         if hours <= 0:
@@ -637,6 +686,9 @@ def _admin_time_step1(message):
 def _admin_time_step2(message):
     if message.from_user.id != ADMIN_ID:
         return
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
+        return
     try:
         hours = int(message.text.strip())
         if hours <= 0:
@@ -655,6 +707,9 @@ def _admin_time_step2(message):
 
 def _admin_threshold_step(message):
     if message.from_user.id != ADMIN_ID:
+        return
+    if not message.text:
+        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
         return
     try:
         val = int(message.text.strip())
@@ -703,9 +758,11 @@ def _admin_stop_round() -> str:
                 rooms_to_check.add(room)
 
         for uid_str, voted_side in b.get("voters", {}).items():
-            if winning_side and voted_side == winning_side and uid_str in users:
-                u = users[uid_str]
-                u["coins"]  = min(u.get("coins", 0) + 1, COINS_MAX)
+            if uid_str not in users:
+                continue
+            u = users[uid_str]
+            u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
+            if winning_side and voted_side == winning_side:
                 u["rating"] = u.get("rating", 0) + 1
 
         try:

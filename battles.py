@@ -118,11 +118,11 @@ def finish_battle(bid: str):
         winning_side = 0
 
     for uid_str, voted_side in b.get("voters", {}).items():
-        if winning_side == 0:
-            break
-        if voted_side == winning_side and uid_str in users:
-            u = users[uid_str]
-            u["coins"]  = min(u.get("coins", 0) + 1, COINS_MAX)
+        if uid_str not in users:
+            continue
+        u = users[uid_str]
+        u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
+        if winning_side != 0 and voted_side == winning_side:
             u["rating"] = u.get("rating", 0) + 1
 
     if winning_side == 0:
@@ -347,7 +347,7 @@ def _send_beat(message):
         _bot.send_message(
             message.chat.id,
             f"🪙 Не хватает монет.\nНужно: {cost}, у тебя: {coins} (ещё нужно: {need})\n\n"
-            f"Голосуй в батлах — правильный голос даёт +1 монету.\nНажми 🗳 Голосовать",
+            f"Голосуй в батлах — каждый голос даёт +1 монету.\nНажми 🗳 Голосовать",
             reply_markup=get_menu(user_id),
         )
         return
@@ -554,7 +554,7 @@ def _vote_menu(message):
     _bot.send_message(
         message.chat.id,
         f"🗳 Батлов для голосования: {len(not_voted)}\n\n"
-        f"Правильный голос → +1 монета и +1 рейтинг!\nИмена скрыты до твоего голоса. 👇",
+        f"Каждый голос → +1 монета! Угадаешь победителя — ещё и +1 рейтинг.\nИмена скрыты до твоего голоса. 👇",
     )
     send_next_battle_for_vote(message.chat.id, user_id, not_voted)
 
@@ -607,7 +607,7 @@ def _handle_vote(call):
     _bot.send_message(
         call.message.chat.id,
         f"👤 Бит 1 — {p1_nick}\n👤 Бит 2 — {p2_nick}\n\n"
-        f"Если угадал победителя — получишь +1 монету после завершения батла.",
+        f"+1 монета засчитается после завершения батла. Угадал победителя — будет ещё +1 рейтинг.",
     )
 
     required, already_voted, not_voted = votes_needed(user_id)

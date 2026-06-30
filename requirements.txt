@@ -1,2 +1,3 @@
+# sqlite3 встроен в стандартную библиотеку Python — ставить отдельно не нужно
 pyTelegramBotAPI>=4.14.0
 APScheduler>=3.10.0

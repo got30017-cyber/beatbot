@@ -3,9 +3,13 @@ __pycache__/
 *.pyc
 *.pyo
 
-# JSON data files (persisted on Railway volume, not in git)
+# SQLite data (persisted on Railway volume, not in git)
+beat_battle.db
+
+# Legacy JSON data files + post-migration backups (not in git)
 users.json
 battles.json
 queue.json
 finals.json
 settings.json
+*.json.bak
