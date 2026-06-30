@@ -142,43 +142,15 @@ def save_nickname(message):
         return
 
     users[user_id] = default_user(nickname)
+    users[user_id]["role"] = "beatmaker"   # технический дефолт — роли больше не выбираются
     save_users(users)
 
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.add(
-        telebot.types.KeyboardButton("🎵 Я битмейкер"),
-        telebot.types.KeyboardButton("🎧 Я слушатель"),
-    )
     bot.send_message(
         message.chat.id,
-        f"✅ Никнейм сохранён: {nickname}\n\nВыбери роль:",
-        reply_markup=markup,
+        f"✅ Никнейм сохранён: {nickname}\n\n"
+        f"Теперь ты можешь отправлять биты на батлы и голосовать за чужие. Жми на кнопки внизу 👇",
+        reply_markup=get_menu(user_id),
     )
-
-
-@bot.message_handler(func=lambda m: m.text in ["🎵 Я битмейкер", "🎧 Я слушатель"])
-def save_role(message):
-    user_id = str(message.from_user.id)
-    users   = load_users()
-
-    if user_id not in users:
-        bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
-        return
-
-    role = "beatmaker" if "битмейкер" in message.text else "listener"
-    users[user_id]["role"] = role
-    save_users(users)
-
-    if role == "beatmaker":
-        text = (
-            "🎵 Отлично! Загружай биты и побеждай в батлах.\n\n"
-            f"Отправка бита стоит {BEAT_COST_FREE} монеты.\n"
-            "Голосуй в батлах — зарабатывай монеты!"
-        )
-    else:
-        text = "🎧 Отлично! Голосуй в батлах, зарабатывай монеты и пиши победителям. Удачи!"
-
-    bot.send_message(message.chat.id, text, reply_markup=get_menu(user_id))
 
 
 # ─── Профиль ──────────────────────────────────
@@ -187,7 +159,6 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
     u       = users[user_id]
     badge   = get_badge(u.get("wins", 0), u.get("final_wins", 0))
     pro_str = "💎 Pro" if u.get("is_pro") else "Free"
-    role    = u.get("role", "")
 
     room_wins = get_room_wins(user_id, battles_data)
     best_room = max(room_wins, key=lambda r: room_wins[r])
@@ -210,8 +181,7 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
     ]
     if best_wins > 0:
         lines.append(f"🎯 Лучшая комната: {ROOM_LABELS[best_room]} ({best_wins} побед)")
-    if role == "beatmaker":
-        lines.append(f"⚔️ Батлов сегодня осталось: {battles_left}")
+    lines.append(f"⚔️ Батлов сегодня осталось: {battles_left}")
     bio = u.get("bio", "").strip()
     if bio:
         lines.append(f"\n📝 {bio}")
@@ -302,8 +272,7 @@ def handle_view_profile(call):
         lines.append(f"\n📝 {bio}")
 
     markup = None
-    viewer = users.get(viewer_uid, {})
-    if viewer_uid != target_uid and viewer.get("role") == "listener":
+    if viewer_uid != target_uid:
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(telebot.types.InlineKeyboardButton("✉️ Написать", callback_data=f"write_{target_uid}"))
 

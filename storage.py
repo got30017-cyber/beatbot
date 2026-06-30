@@ -477,27 +477,17 @@ def user_in_queue(user_id: str, queue: dict):
 
 
 def get_menu(user_id: str, bot_ref=None):
-    users = load_users()
     queue = load_queue()
-    u     = users.get(str(user_id), {})
-    role  = u.get("role", "beatmaker")
     in_q  = user_in_queue(str(user_id), queue) is not None
 
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    if role == "beatmaker":
-        beat_btn = "✏️ Редактировать бит" if in_q else "🎵 Отправить бит"
-        markup.add(
-            telebot.types.KeyboardButton(beat_btn),
-            telebot.types.KeyboardButton("⚔️ Мой батл"),
-            telebot.types.KeyboardButton("🗳 Голосовать"),
-            telebot.types.KeyboardButton("📊 Мой профиль"),
-            telebot.types.KeyboardButton("🏆 Рейтинг"),
-        )
-    else:
-        markup.add(
-            telebot.types.KeyboardButton("🗳 Голосовать"),
-            telebot.types.KeyboardButton("📊 Мой профиль"),
-            telebot.types.KeyboardButton("🏆 Рейтинг"),
-            telebot.types.KeyboardButton("🎯 Звёзды"),
-        )
+    beat_btn = "✏️ Редактировать бит" if in_q else "🎵 Отправить бит"
+    markup   = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        telebot.types.KeyboardButton(beat_btn),
+        telebot.types.KeyboardButton("⚔️ Мой батл"),
+        telebot.types.KeyboardButton("🗳 Голосовать"),
+        telebot.types.KeyboardButton("📊 Мой профиль"),
+        telebot.types.KeyboardButton("🏆 Рейтинг"),
+        telebot.types.KeyboardButton("🎯 Звёзды"),
+    )
     return markup
