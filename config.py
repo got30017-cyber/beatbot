@@ -3,7 +3,8 @@ import sys
 
 # ─── Пути к файлам ───────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE  = os.path.join(BASE_DIR, "beat_battle.db")
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+DB_FILE  = os.path.join(DATA_DIR, "beat_battle.db")
 
 # ─── Telegram credentials ────────────────────
 TOKEN    = os.environ.get("BOT_TOKEN")
