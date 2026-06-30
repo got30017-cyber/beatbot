@@ -8,6 +8,8 @@ from config import (
     ROOMS, ROOM_LABELS,
     COINS_MAX, BEAT_COST_FREE, BEAT_COST_PRO,
     DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
+    BATTLE_HOURS, FINAL_HOURS,
+    MESSAGE_DAILY_LIMIT, MESSAGE_COOLDOWN_MINUTES,
     _settings,
     get_battle_hours, get_final_hours, get_final_threshold,
 )
@@ -40,8 +42,9 @@ battles.register_handlers(bot)
 finals.register_handlers(bot)
 
 # ─── Сессии ──────────────────────────────────
-msg_pending   = {}   # user_id -> target_user_id
-admin_session = {}   # admin_id -> target_uid (флоу начисления монет)
+msg_pending    = {}   # user_id -> target_user_id
+admin_session  = {}   # admin_id -> target_uid (флоу начисления монет)
+last_message_to = {}  # (sender_uid, target_uid) -> datetime, не персистится
 
 _NICKNAME_RE = re.compile(r'^[\w ]+$', re.UNICODE)
 
@@ -359,6 +362,25 @@ def handle_rating_room(call):
     bot.answer_callback_query(call.id)
 
 
+# ─── Помощь ───────────────────────────────────
+
+@bot.message_handler(commands=["help"])
+def cmd_help(message):
+    bot.send_message(
+        message.chat.id,
+        "ℹ️ Как работает Beat Battle\n\n"
+        "🎵 Битмейкер шлёт трек — бот ищет соперника и стартует батл.\n"
+        "🗳 Слушатели слушают оба бита анонимно и голосуют за лучший "
+        f"(кнопки голосования открываются через {battles.VOTE_UNLOCK_DELAY} секунд — дай треку доиграть).\n"
+        "🏆 Лучшие биты раунда попадают в финал — финальное голосование определяет чемпиона.\n"
+        "🪙 Монеты нужны для отправки бита, зарабатываются за голосование.\n"
+        "⭐️ Рейтинг растёт за победы в батлах и финалах.\n\n"
+        "Команды: /start, /profile, /rating, /winners, /final, /help\n\n"
+        "Что-то сломалось или не так? Нажми ⚠️ под битом, чтобы пожаловаться, "
+        "либо напиши организатору бота напрямую.",
+    )
+
+
 # ─── Витрина ──────────────────────────────────
 
 @bot.message_handler(commands=["winners"])
@@ -458,8 +480,32 @@ def handle_outgoing_message(message):
         bot.send_message(message.chat.id, "Пустое сообщение не отправлено.")
         return
 
-    users       = load_users()
-    sender_nick = users.get(sender_uid, {}).get("nickname", "Неизвестный")
+    users  = load_users()
+    sender = users.get(sender_uid)
+    if not sender:
+        bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
+        return
+
+    today = datetime.now().date().isoformat()
+    if sender.get("last_message_date") != today:
+        sender["messages_sent_today"] = 0
+        sender["last_message_date"]   = today
+
+    if sender.get("messages_sent_today", 0) >= MESSAGE_DAILY_LIMIT:
+        save_users(users)
+        bot.send_message(
+            message.chat.id,
+            f"⛔️ Лимит сообщений на сегодня исчерпан ({MESSAGE_DAILY_LIMIT}/день). Попробуй завтра.",
+        )
+        return
+
+    pair_key  = (sender_uid, target_uid)
+    last_sent = last_message_to.get(pair_key)
+    if last_sent and (datetime.now() - last_sent).total_seconds() < MESSAGE_COOLDOWN_MINUTES * 60:
+        bot.send_message(message.chat.id, "⏳ Подожди немного перед следующим сообщением этому человеку.")
+        return
+
+    sender_nick = sender.get("nickname", "Неизвестный")
 
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(
@@ -472,6 +518,9 @@ def handle_outgoing_message(message):
             f"📬 Новое сообщение!\n\nОт: {sender_nick}\n\"{text}\"",
             reply_markup=markup,
         )
+        sender["messages_sent_today"] = sender.get("messages_sent_today", 0) + 1
+        save_users(users)
+        last_message_to[pair_key] = datetime.now()
         bot.send_message(message.chat.id, "✅ Сообщение отправлено!", reply_markup=get_menu(sender_uid))
     except Exception:
         bot.send_message(message.chat.id, "⚠️ Не удалось доставить сообщение.")
@@ -931,6 +980,15 @@ def restore_timers():
 
 # ─── Запуск ───────────────────────────────────
 _settings.update(load_settings())
+
+# Одноразовое обновление длительности батлов/финалов под маленькую аудиторию.
+# Срабатывает один раз — дальше не перетирает значения, заданные через /admin.
+if not _settings.get("_short_durations_applied"):
+    _settings["battle_hours"]              = BATTLE_HOURS
+    _settings["final_hours"]               = FINAL_HOURS
+    _settings["_short_durations_applied"]  = True
+    save_settings(_settings)
+
 restore_timers()
 print("Бот запущен!")
 bot.infinity_polling()

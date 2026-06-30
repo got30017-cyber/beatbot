@@ -28,6 +28,19 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_user_columns(conn: sqlite3.Connection):
+    """Добавляет новые колонки users в БД, созданную до их появления."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+    new_columns = {
+        "messages_sent_today": "INTEGER DEFAULT 0",
+        "last_message_date":   "TEXT",
+        "last_notified_at":    "TEXT",
+    }
+    for col, decl in new_columns.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+
+
 # ─── Инициализация БД ────────────────────────
 
 def init_db():
@@ -36,20 +49,24 @@ def init_db():
         with conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    id                TEXT PRIMARY KEY,
-                    nickname          TEXT,
-                    role              TEXT,
-                    rating            INTEGER DEFAULT 0,
-                    coins             INTEGER DEFAULT 3,
-                    wins              INTEGER DEFAULT 0,
-                    final_wins        INTEGER DEFAULT 0,
-                    battles_today     INTEGER DEFAULT 0,
-                    last_battle_date  TEXT,
-                    is_pro            INTEGER DEFAULT 0,
-                    bio               TEXT DEFAULT '',
-                    votes_this_round  TEXT DEFAULT '[]'
+                    id                    TEXT PRIMARY KEY,
+                    nickname              TEXT,
+                    role                  TEXT,
+                    rating                INTEGER DEFAULT 0,
+                    coins                 INTEGER DEFAULT 3,
+                    wins                  INTEGER DEFAULT 0,
+                    final_wins            INTEGER DEFAULT 0,
+                    battles_today         INTEGER DEFAULT 0,
+                    last_battle_date      TEXT,
+                    is_pro                INTEGER DEFAULT 0,
+                    bio                   TEXT DEFAULT '',
+                    votes_this_round      TEXT DEFAULT '[]',
+                    messages_sent_today   INTEGER DEFAULT 0,
+                    last_message_date     TEXT,
+                    last_notified_at      TEXT
                 )
             """)
+            _ensure_user_columns(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS battles (
                     id                  TEXT PRIMARY KEY,
@@ -160,17 +177,20 @@ def load_users() -> dict:
         conn.close()
     return {
         row["id"]: {
-            "nickname":         row["nickname"],
-            "role":             row["role"],
-            "rating":           row["rating"],
-            "coins":            row["coins"],
-            "wins":             row["wins"],
-            "final_wins":       row["final_wins"],
-            "battles_today":    row["battles_today"],
-            "last_battle_date": row["last_battle_date"],
-            "is_pro":           bool(row["is_pro"]),
-            "votes_this_round": json.loads(row["votes_this_round"] or "[]"),
-            "bio":              row["bio"] or "",
+            "nickname":            row["nickname"],
+            "role":                row["role"],
+            "rating":              row["rating"],
+            "coins":               row["coins"],
+            "wins":                row["wins"],
+            "final_wins":          row["final_wins"],
+            "battles_today":       row["battles_today"],
+            "last_battle_date":    row["last_battle_date"],
+            "is_pro":              bool(row["is_pro"]),
+            "votes_this_round":    json.loads(row["votes_this_round"] or "[]"),
+            "bio":                 row["bio"] or "",
+            "messages_sent_today": row["messages_sent_today"] or 0,
+            "last_message_date":   row["last_message_date"],
+            "last_notified_at":    row["last_notified_at"],
         }
         for row in rows
     }
@@ -184,8 +204,9 @@ def save_users(users: dict):
             conn.executemany(
                 """INSERT INTO users
                    (id, nickname, role, rating, coins, wins, final_wins,
-                    battles_today, last_battle_date, is_pro, bio, votes_this_round)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    battles_today, last_battle_date, is_pro, bio, votes_this_round,
+                    messages_sent_today, last_message_date, last_notified_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         uid,
@@ -200,6 +221,9 @@ def save_users(users: dict):
                         int(bool(u.get("is_pro"))),
                         u.get("bio", ""),
                         json.dumps(u.get("votes_this_round", []), ensure_ascii=False),
+                        u.get("messages_sent_today", 0),
+                        u.get("last_message_date"),
+                        u.get("last_notified_at"),
                     )
                     for uid, u in users.items()
                 ],
@@ -388,17 +412,20 @@ def save_settings(settings: dict):
 
 def default_user(nickname: str) -> dict:
     return {
-        "nickname":         nickname,
-        "role":             None,
-        "rating":           0,
-        "coins":            3,
-        "wins":             0,
-        "final_wins":       0,
-        "battles_today":    0,
-        "last_battle_date": None,
-        "is_pro":           False,
-        "votes_this_round": [],
-        "bio":              "",
+        "nickname":            nickname,
+        "role":                None,
+        "rating":              0,
+        "coins":               3,
+        "wins":                0,
+        "final_wins":          0,
+        "battles_today":       0,
+        "last_battle_date":    None,
+        "is_pro":              False,
+        "votes_this_round":    [],
+        "bio":                 "",
+        "messages_sent_today": 0,
+        "last_message_date":   None,
+        "last_notified_at":    None,
     }
 
 

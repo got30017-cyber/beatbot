@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from config import (
     ADMIN_ID, ROOMS, ROOM_LABELS,
     COINS_MAX, BEAT_COST_FREE, BEAT_COST_PRO,
+    NOTIFY_THROTTLE_HOURS,
     _settings, get_battle_hours,
 )
 from storage import (
@@ -396,14 +397,44 @@ def _send_beat(message):
         _bot.send_message(message.chat.id, "⏳ Твой бит уже в очереди.\n\nХочешь отменить?", reply_markup=markup)
         return
 
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    for room, label in ROOM_LABELS.items():
-        markup.add(telebot.types.InlineKeyboardButton(label, callback_data=f"room_{room}"))
+    # Одна комната на старте — сразу просим аудиофайл, без шага выбора жанра
+    vote_context[f"room_{user_id}"] = ROOMS[0]
     _bot.send_message(
         message.chat.id,
-        f"🎵 Выбери жанровую комнату:\n\n(Стоимость: {cost} монеты, у тебя: {coins})",
-        reply_markup=markup,
+        f"🎵 Отправь аудиофайл с битом:\n\n(Стоимость: {cost} монеты, у тебя: {coins})",
     )
+
+
+def _notify_new_battle(exclude_ids: set):
+    users   = load_users()
+    now     = datetime.now()
+    changed = False
+
+    for uid, u in users.items():
+        if uid in exclude_ids:
+            continue
+        if u.get("role") not in ("listener", "beatmaker"):
+            continue
+
+        last_notified = u.get("last_notified_at")
+        if last_notified:
+            try:
+                last_dt = datetime.fromisoformat(last_notified)
+            except ValueError:
+                last_dt = None
+            if last_dt and (now - last_dt).total_seconds() < NOTIFY_THROTTLE_HOURS * 3600:
+                continue
+
+        try:
+            _bot.send_message(uid, "⚔️ Новый батл ждёт твоего голоса! Нажми 🗳 Голосовать")
+        except Exception:
+            continue
+
+        u["last_notified_at"] = now.isoformat()
+        changed = True
+
+    if changed:
+        save_users(users)
 
 
 def _handle_room_select(call):
@@ -553,6 +584,8 @@ def _receive_beat(message):
             f"Голосование открыто {get_battle_hours()} часов.",
             reply_markup=get_menu(user_id),
         )
+
+        _notify_new_battle(exclude_ids={opponent_id, user_id})
     else:
         queue[room][user_id] = file_id
         save_queue(queue)
