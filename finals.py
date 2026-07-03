@@ -11,7 +11,6 @@ from storage import (
     load_battles, save_battles,
     load_users, save_users,
     get_menu,
-    _battle_scores,
 )
 
 _bot: telebot.TeleBot = None
@@ -39,10 +38,10 @@ def count_final_candidates(room: str, battles: dict) -> int:
                 and b.get("counted_for_final")
                 and not b.get("included_in_final")
                 and b.get("room") == room):
-            s1, s2 = _battle_scores(b)
-            if s1 > s2:
+            v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
+            if v1 > v2:
                 seen.add(b["player1"])
-            elif s2 > s1:
+            elif v2 > v1:
                 seen.add(b["player2"])
     return len(seen)
 
@@ -55,10 +54,10 @@ def _collect_final_candidates(room: str, battles: dict) -> list:
                 and b.get("counted_for_final")
                 and not b.get("included_in_final")
                 and b.get("room") == room):
-            s1, s2 = _battle_scores(b)
-            if s1 > s2:
+            v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
+            if v1 > v2:
                 winner_id, file_id = b["player1"], b.get("beat1_file_id")
-            elif s2 > s1:
+            elif v2 > v1:
                 winner_id, file_id = b["player2"], b.get("beat2_file_id")
             else:
                 continue

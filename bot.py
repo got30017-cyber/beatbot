@@ -23,7 +23,7 @@ from storage import (
     get_menu,
     load_settings, save_settings,
     init_db, migrate_from_json,
-    _battle_scores, _category_mode_summary,
+    _category_mode_summary,
 )
 import battles
 import finals
@@ -397,8 +397,8 @@ def cmd_help(message):
         message.chat.id,
         "ℹ️ Как работает Beat Battle\n\n"
         "🎵 Битмейкер шлёт трек — бот ищет соперника и стартует батл.\n"
-        "🗳 Слушатели слушают оба бита анонимно и голосуют за лучший "
-        f"(кнопки голосования открываются через {battles.VOTE_UNLOCK_DELAY} секунд — дай треку доиграть).\n"
+        "🗳 Слушатели слушают оба бита анонимно и голосуют за лучший, "
+        "потом угадывают выбор большинства.\n"
         "🏆 Лучшие биты раунда попадают в финал — финальное голосование определяет чемпиона.\n"
         "🪙 Монеты нужны для отправки бита, зарабатываются за голосование.\n"
         "⭐️ Рейтинг растёт за победы в батлах и финалах.\n\n"
@@ -425,10 +425,10 @@ def show_winners(message):
 
     winners_cards = []
     for bid, b in finished:
-        s1, s2 = _battle_scores(b)
-        if s1 > s2:
+        v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
+        if v1 > v2:
             winner_id = b["player1"]
-        elif s2 > s1:
+        elif v2 > v1:
             winner_id = b["player2"]
         else:
             continue
@@ -811,7 +811,6 @@ def _admin_stop_round() -> str:
 
     for bid, b in active.items():
         votes1, votes2 = b.get("votes1", 0), b.get("votes2", 0)
-        score1, score2 = _battle_scores(b)
         p1, p2         = b["player1"], b["player2"]
         p1_nick        = users.get(p1, {}).get("nickname", "Игрок 1")
         p2_nick        = users.get(p2, {}).get("nickname", "Игрок 2")
@@ -820,9 +819,9 @@ def _admin_stop_round() -> str:
         b["status"]   = "finished"
         b["end_time"] = datetime.now().isoformat()
 
-        if score1 > score2:
+        if votes1 > votes2:
             winner_id, winning_side = p1, 1
-        elif score2 > score1:
+        elif votes2 > votes1:
             winner_id, winning_side = p2, 2
         else:
             winner_id, winning_side = None, 0
@@ -834,16 +833,12 @@ def _admin_stop_round() -> str:
             if room:
                 rooms_to_check.add(room)
 
-        for uid_str, entry in b.get("feedback", {}).items():
+        for uid_str, voted_side in b.get("votes", {}).items():
             if uid_str not in users:
                 continue
-            user_score1  = sum(RATING_POINTS.get(v, 0) for v in entry.get("1", {}).values())
-            user_score2  = sum(RATING_POINTS.get(v, 0) for v in entry.get("2", {}).values())
-            implied_side = 1 if user_score1 > user_score2 else 2 if user_score2 > user_score1 else 0
-
             u = users[uid_str]
             u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
-            if winning_side and implied_side == winning_side:
+            if winning_side and voted_side == str(winning_side):
                 u["rating"] = u.get("rating", 0) + 1
 
         try:
@@ -892,9 +887,11 @@ def _admin_stop_round() -> str:
     # Очищаем сессионные данные в battles
     battles.vote_session.clear()
     battles.vote_context.clear()
-    battles.vote_unlocked_at.clear()
     battles.pending_feedback.clear()
     battles._first_side_shown.clear()
+    battles.pending_prediction.clear()
+    battles.pair_shown_at.clear()
+    battles.voted_at.clear()
 
     save_battles(battles_data)
     save_users(users)

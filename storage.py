@@ -46,7 +46,9 @@ def _ensure_battle_columns(conn: sqlite3.Connection):
     """Добавляет новые колонки battles в БД, созданную до их появления."""
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(battles)").fetchall()}
     new_columns = {
-        "feedback": "TEXT DEFAULT '{}'",
+        "feedback":    "TEXT DEFAULT '{}'",
+        "votes":       "TEXT DEFAULT '{}'",
+        "predictions": "TEXT DEFAULT '{}'",
     }
     for col, decl in new_columns.items():
         if col not in existing:
@@ -95,7 +97,9 @@ def init_db():
                     end_time            TEXT,
                     counted_for_final   INTEGER DEFAULT 0,
                     included_in_final   TEXT,
-                    feedback            TEXT DEFAULT '{}'
+                    feedback            TEXT DEFAULT '{}',
+                    votes               TEXT DEFAULT '{}',
+                    predictions         TEXT DEFAULT '{}'
                 )
             """)
             _ensure_battle_columns(conn)
@@ -270,6 +274,8 @@ def load_battles() -> dict:
             "counted_for_final": bool(row["counted_for_final"]),
             "included_in_final": row["included_in_final"],
             "feedback":          json.loads(row["feedback"] or "{}"),
+            "votes":             json.loads(row["votes"] or "{}"),
+            "predictions":       json.loads(row["predictions"] or "{}"),
         }
         for row in rows
     }
@@ -284,8 +290,8 @@ def save_battles(battles: dict):
                 """INSERT INTO battles
                    (id, player1, player2, beat1_file_id, beat2_file_id,
                     votes1, votes2, voters, status, room, start_time, end_time,
-                    counted_for_final, included_in_final, feedback)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    counted_for_final, included_in_final, feedback, votes, predictions)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         bid,
@@ -303,6 +309,8 @@ def save_battles(battles: dict):
                         int(bool(b.get("counted_for_final"))),
                         b.get("included_in_final"),
                         json.dumps(b.get("feedback", {}), ensure_ascii=False),
+                        json.dumps(b.get("votes", {}), ensure_ascii=False),
+                        json.dumps(b.get("predictions", {}), ensure_ascii=False),
                     )
                     for bid, b in battles.items()
                 ],
@@ -511,10 +519,10 @@ def get_room_wins(uid_str: str, battles: dict) -> dict:
         room = b.get("room")
         if not room or room not in wins:
             continue
-        s1, s2 = _battle_scores(b)
-        if s1 > s2 and b.get("player1") == uid_str:
+        v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
+        if v1 > v2 and b.get("player1") == uid_str:
             wins[room] += 1
-        elif s2 > s1 and b.get("player2") == uid_str:
+        elif v2 > v1 and b.get("player2") == uid_str:
             wins[room] += 1
     return wins
 
