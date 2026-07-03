@@ -44,11 +44,12 @@ def init(bot: telebot.TeleBot, scheduler):
 # ─── Вспомогательные функции голосования ─────
 
 def get_eligible_battles(user_id: str) -> dict:
-    battles = load_battles()
+    battles  = load_battles()
+    is_admin = user_id == str(ADMIN_ID)
     return {
         bid: b for bid, b in battles.items()
         if b["status"] == "active"
-        and user_id not in [b["player1"], b["player2"]]
+        and (is_admin or user_id not in [b["player1"], b["player2"]])
     }
 
 
