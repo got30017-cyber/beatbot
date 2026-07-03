@@ -322,7 +322,7 @@ def _handle_vote(call):
     if not b or b["status"] != "active":
         _bot.answer_callback_query(call.id, "Этот батл уже завершён.")
         return
-    if user_id in [b["player1"], b["player2"]]:
+    if user_id in [b["player1"], b["player2"]] and user_id != str(ADMIN_ID):
         _bot.answer_callback_query(call.id, "Нельзя голосовать в своём батле.")
         return
     if user_id in b.get("votes", {}):
