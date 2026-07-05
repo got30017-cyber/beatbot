@@ -16,6 +16,8 @@ from storage import (
     _empty_queue,
     check_daily_limit, user_in_queue, get_menu,
     _category_mode_summary,
+    add_pair_rating, resolve_pair_ratings,
+    get_user_intuition_stats, get_all_intuition_accuracy,
 )
 from finals import check_and_start_final
 
@@ -109,6 +111,42 @@ def _feedback_summary_text(b: dict, side: str):
     return "\n".join(lines)
 
 
+def build_intuition_summary(user_id: str, since_iso: str):
+    """Персональная сводка интуиции за период. None, если 0 разрешённых пар.
+
+    Самостоятельная функция, не привязана к финалу: сейчас вызывается из
+    завершения финала, при переходе на недельный цикл переедет туда.
+    """
+    stats = get_user_intuition_stats(user_id, since_iso)
+    total = stats["total_resolved"]
+    if total == 0:
+        return None
+
+    correct  = stats["correct"]
+    reward_a = stats["reward_a"]
+    reward_b = stats["reward_b"]
+    pairs    = stats["pairs_rated"]
+
+    # Хвост-процентиль на первую строку — только при достаточных данных.
+    tail = ""
+    if total >= 3:
+        accuracy = get_all_intuition_accuracy(since_iso)
+        others   = [c / t for uid, (c, t) in accuracy.items() if uid != user_id]
+        if len(others) >= 3:
+            my_acc = correct / total
+            below  = sum(1 for a in others if a < my_acc)   # строго ниже
+            pct    = round(below / len(others) * 100)
+            tail   = f" — чувствуешь сообщество лучше, чем {pct}% участников"
+
+    lines = [
+        f"🧠 Твоя интуиция за этот цикл: угадал {correct} из {total}{tail}",
+        f"🤝 Совпал с сообществом: {reward_a} раз",
+        f"🦅 Белая ворона с чутьём: {reward_b} раз",
+        f"❤️ Оценено пар: {pairs}",
+    ]
+    return "\n".join(lines)
+
+
 # ─── Завершение батла ─────────────────────────
 
 def finish_battle(bid: str):
@@ -144,14 +182,20 @@ def finish_battle(bid: str):
     else:
         winning_side = 0
 
-    # +1 монета всем проголосовавшим; +1 рейтинг тем, чей голос совпал с победителем
-    for uid_str, voted_side in b.get("votes", {}).items():
-        if uid_str not in users:
-            continue
-        u = users[uid_str]
-        u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
-        if winning_side != 0 and voted_side == str(winning_side):
-            u["rating"] = u.get("rating", 0) + 1
+    resolve_pair_ratings(bid, str(winning_side))
+
+    # +1 монета всем проголосовавшим (за участие в голосовании)
+    for uid_str in b.get("votes", {}):
+        if uid_str in users:
+            users[uid_str]["coins"] = min(users[uid_str].get("coins", 0) + 1, COINS_MAX)
+
+    # +1 рейтинг тем, чей ПРОГНОЗ совпал с победившей стороной.
+    # Награда перенесена с голоса на прогноз: награда за «правильный» голос
+    # стимулирует голосовать за фаворита, а не честно; прогноз — честное угадывание.
+    if winning_side != 0:
+        for uid_str, pred_side in b.get("predictions", {}).items():
+            if uid_str in users and pred_side == str(winning_side):
+                users[uid_str]["rating"] = users[uid_str].get("rating", 0) + 1
 
     if winning_side == 0:
         total = votes1 + votes2
@@ -243,6 +287,8 @@ def _force_finish_battle(bid: str, winning_side: int):
         users[winner_id]["rating"] = users[winner_id].get("rating", 0) + 10
         users[winner_id]["wins"]   = users[winner_id].get("wins", 0) + 1
     b["counted_for_final"] = True
+
+    resolve_pair_ratings(bid, str(winning_side))
 
     try:
         _scheduler.remove_job(bid)
@@ -389,6 +435,14 @@ def _handle_prediction(call):
     b["predictions"][user_id] = pred_side
     save_battles(battles_data)
 
+    # Построчная запись пары в аналитику. Метки времени живут в памяти и могут
+    # отсутствовать (рестарт бота) — тогда time_on_pair будет NULL, не падаем.
+    add_pair_rating(
+        user_id, bid,
+        pending["vote_side"], pred_side,
+        pair_shown_at.get(user_id), voted_at.get(user_id),
+    )
+
     if user_id in users:
         vtr = users[user_id].get("votes_this_round", [])
         if bid not in vtr:
@@ -420,7 +474,7 @@ def _send_vote_summary(chat_id, user_id: str, bid: str, vote_side: str, pred_sid
     text = (
         f"❤️ Твой выбор: Бит {vote_side} — {vote_nick}\n"
         f"🧠 Твой прогноз: Бит {pred_side} — {pred_nick}\n\n"
-        f"Угадал ли ты мнение большинства — узнаешь в конце батла."
+        f"Угадал ли ты мнение большинства — узнаешь в конце финала. 🤫"
     )
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.row(

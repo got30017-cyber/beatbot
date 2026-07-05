@@ -10,6 +10,7 @@ from storage import (
     load_finals, save_finals,
     load_battles, save_battles,
     load_users, save_users,
+    load_settings, save_settings,
     get_menu,
 )
 
@@ -139,6 +140,34 @@ def _start_final(room: str, candidates: list):
             pass
 
 
+def _broadcast_intuition_summaries():
+    """Рассылает каждому пользователю персональную сводку интуиции за цикл.
+
+    Период — от settings["summary_since"] (по умолчанию всё). После рассылки
+    сдвигает summary_since на текущий момент, чтобы следующий цикл подводил
+    итог со времени этой рассылки. Ошибка у одного юзера не роняет остальных.
+    """
+    from battles import build_intuition_summary   # ленивый импорт — избегаем циклической зависимости
+
+    settings  = load_settings()
+    since_iso = settings.get("summary_since", "1970-01-01")
+
+    for uid in load_users():
+        try:
+            summary = build_intuition_summary(uid, since_iso)
+        except Exception:
+            continue
+        if not summary:
+            continue
+        try:
+            _bot.send_message(uid, summary)
+        except Exception:
+            pass
+
+    settings["summary_since"] = datetime.now().isoformat()
+    save_settings(settings)
+
+
 def finish_final(fid: str):
     finals = load_finals()
     users  = load_users()
@@ -163,6 +192,9 @@ def finish_final(fid: str):
                 )
             except Exception:
                 pass
+        # ВРЕМЕННО: триггер сводки — конец финала; при переходе на недельный
+        # цикл вызов переедет в завершение недели.
+        _broadcast_intuition_summaries()
         return
 
     winner_id    = max(votes, key=lambda uid: votes[uid])
@@ -202,6 +234,10 @@ def finish_final(fid: str):
             _bot.send_message(uid, msg)
         except Exception:
             pass
+
+    # ВРЕМЕННО: триггер сводки — конец финала; при переходе на недельный
+    # цикл вызов переедет в завершение недели.
+    _broadcast_intuition_summaries()
 
 
 # ─── Команда /final ───────────────────────────

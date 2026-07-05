@@ -129,6 +129,23 @@ def init_db():
                     value  TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pair_ratings (
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id            TEXT NOT NULL,
+                    battle_id          TEXT NOT NULL,
+                    vote_side          TEXT NOT NULL,
+                    pred_side          TEXT NOT NULL,
+                    shown_at           TEXT,
+                    voted_at           TEXT,
+                    predicted_at       TEXT NOT NULL,
+                    time_on_pair       REAL,
+                    diverged           INTEGER NOT NULL,
+                    winning_side       TEXT,
+                    prediction_correct INTEGER,
+                    UNIQUE(user_id, battle_id)
+                )
+            """)
     finally:
         conn.close()
 
@@ -430,6 +447,134 @@ def save_settings(settings: dict):
             )
     finally:
         conn.close()
+
+
+# ─── Аналитика пар (интуиция/прогнозы) ───────
+# Таблица pair_ratings — append-only, точечные операции без load-all/save-all.
+
+def add_pair_rating(user_id: str, battle_id: str, vote_side: str, pred_side: str,
+                    shown_at, voted_at):
+    """Вставляет строку оценки пары. INSERT OR IGNORE защищает от дублей при двойном тапе.
+
+    time_on_pair считается только если есть обе метки (иначе NULL — метки живут
+    в памяти и теряются при рестарте бота между показом пары и голосом).
+    """
+    time_on_pair = None
+    if shown_at and voted_at:
+        try:
+            time_on_pair = (
+                datetime.fromisoformat(voted_at) - datetime.fromisoformat(shown_at)
+            ).total_seconds()
+        except (ValueError, TypeError):
+            time_on_pair = None
+
+    diverged     = 1 if vote_side != pred_side else 0
+    predicted_at = datetime.now().isoformat()
+
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO pair_ratings
+                   (user_id, battle_id, vote_side, pred_side, shown_at, voted_at,
+                    predicted_at, time_on_pair, diverged)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, battle_id, vote_side, pred_side, shown_at, voted_at,
+                 predicted_at, time_on_pair, diverged),
+            )
+    finally:
+        conn.close()
+
+
+def resolve_pair_ratings(battle_id: str, winning_side: str):
+    """При завершении батла проставляет winning_side и prediction_correct.
+
+    winning_side: "1"|"2"|"0" (ничья). При ничьей prediction_correct остаётся NULL.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            if winning_side in ("1", "2"):
+                conn.execute(
+                    """UPDATE pair_ratings
+                       SET winning_side = ?,
+                           prediction_correct = CASE WHEN pred_side = ? THEN 1 ELSE 0 END
+                       WHERE battle_id = ?""",
+                    (winning_side, winning_side, battle_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE pair_ratings SET winning_side = ? WHERE battle_id = ?",
+                    (winning_side, battle_id),
+                )
+    finally:
+        conn.close()
+
+
+def get_user_intuition_stats(user_id: str, since_iso: str) -> dict:
+    """Статистика прогнозов пользователя за период (predicted_at >= since_iso).
+
+    total_resolved — пар с разрешённым исходом (prediction_correct не NULL).
+    reward_a — голос == прогноз == победитель (diverged=0 и угадал).
+    reward_b — голос != прогноз, но прогноз == победитель (diverged=1 и угадал).
+    pairs_rated — все строки за период, включая неразрешённые.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT prediction_correct, diverged FROM pair_ratings "
+            "WHERE user_id = ? AND predicted_at >= ?",
+            (user_id, since_iso),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    total_resolved = correct = reward_a = reward_b = 0
+    pairs_rated = len(rows)
+    for r in rows:
+        pc = r["prediction_correct"]
+        if pc is None:
+            continue
+        total_resolved += 1
+        if pc == 1:
+            correct += 1
+            if r["diverged"] == 0:
+                reward_a += 1
+            else:
+                reward_b += 1
+
+    return {
+        "total_resolved": total_resolved,
+        "correct":        correct,
+        "reward_a":       reward_a,
+        "reward_b":       reward_b,
+        "pairs_rated":    pairs_rated,
+    }
+
+
+def get_all_intuition_accuracy(since_iso: str) -> dict:
+    """{user_id: (correct, total_resolved)} за период — только пользователи с total_resolved >= 3.
+
+    Нужно для процентиля «лучше, чем N% участников» — люди с одной парой его бы ломали.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT user_id, "
+            "SUM(CASE WHEN prediction_correct = 1 THEN 1 ELSE 0 END) AS correct, "
+            "SUM(CASE WHEN prediction_correct IS NOT NULL THEN 1 ELSE 0 END) AS total_resolved "
+            "FROM pair_ratings WHERE predicted_at >= ? GROUP BY user_id",
+            (since_iso,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    result = {}
+    for r in rows:
+        total = r["total_resolved"] or 0
+        if total >= 3:
+            result[r["user_id"]] = (r["correct"] or 0, total)
+    return result
 
 
 # ─── Шаблон пользователя ─────────────────────
