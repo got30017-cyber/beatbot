@@ -50,10 +50,25 @@ def _ensure_battle_columns(conn: sqlite3.Connection):
         "feedback":    "TEXT DEFAULT '{}'",
         "votes":       "TEXT DEFAULT '{}'",
         "predictions": "TEXT DEFAULT '{}'",
+        "beat1_id":    "TEXT",
+        "beat2_id":    "TEXT",
     }
     for col, decl in new_columns.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE battles ADD COLUMN {col} {decl}")
+
+
+def _ensure_queue_schema(conn: sqlite3.Connection):
+    """Очередь теперь ключуется по beat_id (а не user_id) — нужно для матчинга
+    по битам (история встреч, статус карьеры). Старая схема с этим несовместима.
+
+    Очередь — эфемерные данные ожидания матчинга, не история: при обнаружении
+    старой структуры просто пересоздаём таблицу пустой. Максимум потеряем
+    непойманные ожидающие биты — их авторы отправят заново одной кнопкой.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(queue)").fetchall()}
+    if existing and "beat_id" not in existing:
+        conn.execute("DROP TABLE queue")
 
 
 # ─── Инициализация БД ────────────────────────
@@ -102,13 +117,17 @@ def init_db():
                     included_in_final   TEXT,
                     feedback            TEXT DEFAULT '{}',
                     votes               TEXT DEFAULT '{}',
-                    predictions         TEXT DEFAULT '{}'
+                    predictions         TEXT DEFAULT '{}',
+                    beat1_id            TEXT,
+                    beat2_id            TEXT
                 )
             """)
             _ensure_battle_columns(conn)
+            _ensure_queue_schema(conn)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS queue (
-                    user_id  TEXT PRIMARY KEY,
+                    beat_id  TEXT PRIMARY KEY,
+                    user_id  TEXT,
                     room     TEXT,
                     file_id  TEXT
                 )
@@ -149,6 +168,24 @@ def init_db():
                     UNIQUE(user_id, battle_id)
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS beats (
+                    id             TEXT PRIMARY KEY,
+                    author_id      TEXT NOT NULL,
+                    file_id        TEXT NOT NULL,
+                    title          TEXT DEFAULT '',
+                    status         TEXT NOT NULL,
+                    battles_played INTEGER DEFAULT 0,
+                    wins           INTEGER DEFAULT 0,
+                    losses         INTEGER DEFAULT 0,
+                    draws          INTEGER DEFAULT 0,
+                    predicted_for  INTEGER DEFAULT 0,
+                    created_at     TEXT NOT NULL,
+                    finished_at    TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_author ON beats(author_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_status ON beats(status)")
     finally:
         conn.close()
 
@@ -299,6 +336,8 @@ def load_battles() -> dict:
             "feedback":          json.loads(row["feedback"] or "{}"),
             "votes":             json.loads(row["votes"] or "{}"),
             "predictions":       json.loads(row["predictions"] or "{}"),
+            "beat1_id":          row["beat1_id"],
+            "beat2_id":          row["beat2_id"],
         }
         for row in rows
     }
@@ -313,8 +352,9 @@ def save_battles(battles: dict):
                 """INSERT INTO battles
                    (id, player1, player2, beat1_file_id, beat2_file_id,
                     votes1, votes2, voters, status, room, start_time, end_time,
-                    counted_for_final, included_in_final, feedback, votes, predictions)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    counted_for_final, included_in_final, feedback, votes, predictions,
+                    beat1_id, beat2_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         bid,
@@ -334,6 +374,8 @@ def save_battles(battles: dict):
                         json.dumps(b.get("feedback", {}), ensure_ascii=False),
                         json.dumps(b.get("votes", {}), ensure_ascii=False),
                         json.dumps(b.get("predictions", {}), ensure_ascii=False),
+                        b.get("beat1_id"),
+                        b.get("beat2_id"),
                     )
                     for bid, b in battles.items()
                 ],
@@ -358,20 +400,165 @@ def load_queue() -> dict:
 
 
 def save_queue(queue: dict):
+    """queue: {room: {user_id: file_id}} — внешний формат не меняется, чтобы не
+    трогать вызывающий код. Внутри строка требует beat_id — берём его через
+    find_active_beat_by_user (инвариант: у пользователя максимум один активный
+    бит, и при постановке в очередь он уже в статусе 'queued'). Если бит не
+    найден или уже не 'queued' — строка пропускается защитно, это не должно
+    происходить при соблюдении инварианта.
+    """
+    rows = []
+    for room, entries in queue.items():
+        for uid, file_id in entries.items():
+            beat = find_active_beat_by_user(uid)
+            if not beat or beat["status"] != "queued":
+                continue
+            rows.append((beat["id"], uid, room, file_id))
+
     conn = _connect()
     try:
         with conn:
             conn.execute("DELETE FROM queue")
             conn.executemany(
-                "INSERT INTO queue (user_id, room, file_id) VALUES (?, ?, ?)",
-                [
-                    (uid, room, file_id)
-                    for room, entries in queue.items()
-                    for uid, file_id in entries.items()
-                ],
+                "INSERT INTO queue (beat_id, user_id, room, file_id) VALUES (?, ?, ?, ?)",
+                rows,
             )
     finally:
         conn.close()
+
+
+# ─── Биты (карьера) ───────────────────────────
+# Точечные операции, НЕ load-all/save-all — таблица растёт с каждым битом.
+
+def _beat_row_to_dict(row) -> dict:
+    return {
+        "id":             row["id"],
+        "author_id":      row["author_id"],
+        "file_id":        row["file_id"],
+        "title":          row["title"] or "",
+        "status":         row["status"],
+        "battles_played": row["battles_played"],
+        "wins":           row["wins"],
+        "losses":         row["losses"],
+        "draws":          row["draws"],
+        "predicted_for":  row["predicted_for"],
+        "created_at":     row["created_at"],
+        "finished_at":    row["finished_at"],
+    }
+
+
+def create_beat(author_id: str, file_id: str) -> str:
+    conn = _connect()
+    try:
+        with conn:
+            c = conn.execute("SELECT COUNT(*) AS c FROM beats").fetchone()["c"]
+            beat_id = f"beat_{c + 1}"
+            conn.execute(
+                """INSERT INTO beats (id, author_id, file_id, status, created_at)
+                   VALUES (?, ?, ?, 'queued', ?)""",
+                (beat_id, author_id, file_id, datetime.now().isoformat()),
+            )
+    finally:
+        conn.close()
+    return beat_id
+
+
+def get_beat(beat_id: str):
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM beats WHERE id = ?", (beat_id,)).fetchone()
+    finally:
+        conn.close()
+    return _beat_row_to_dict(row) if row else None
+
+
+def update_beat_status(beat_id: str, status: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE beats SET status = ? WHERE id = ?", (status, beat_id))
+    finally:
+        conn.close()
+
+
+def update_beat_file(beat_id: str, file_id: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE beats SET file_id = ? WHERE id = ?", (file_id, beat_id))
+    finally:
+        conn.close()
+
+
+def record_beat_battle_result(beat_id: str, result: str):
+    """result: 'win' | 'loss' | 'draw'. Инкрементит счётчик и battles_played разом."""
+    column = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result)
+    if not column:
+        return
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                f"UPDATE beats SET {column} = {column} + 1, battles_played = battles_played + 1 WHERE id = ?",
+                (beat_id,),
+            )
+    finally:
+        conn.close()
+
+
+def add_predicted_for(beat_id: str, delta: int):
+    if not delta:
+        return
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE beats SET predicted_for = predicted_for + ? WHERE id = ?",
+                (delta, beat_id),
+            )
+    finally:
+        conn.close()
+
+
+def finish_beat_career(beat_id: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE beats SET status = 'career_finished', finished_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), beat_id),
+            )
+    finally:
+        conn.close()
+
+
+def list_user_beats(user_id: str) -> list:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM beats WHERE author_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_beat_row_to_dict(r) for r in rows]
+
+
+def find_active_beat_by_user(user_id: str):
+    """Бит пользователя в 'queued'/'battling'/'awaiting_decision'. У пользователя
+    максимум один активный бит одновременно (инвариант поддерживается вызывающим
+    кодом в battles.py)."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM beats WHERE author_id = ? "
+            "AND status IN ('queued', 'battling', 'awaiting_decision') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return _beat_row_to_dict(row) if row else None
 
 
 # ─── Finals ───────────────────────────────────

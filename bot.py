@@ -23,6 +23,7 @@ from storage import (
     load_settings, save_settings,
     init_db, migrate_from_json,
     _category_mode_summary,
+    list_user_beats,
 )
 import battles
 import finals
@@ -232,6 +233,22 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
             lines.append("✅ Билет оплачен")
         else:
             lines.append(f"🎧 Билет: {ticket_status['progress']}/{ticket_status['required']} пар оценено")
+
+    user_beats = list_user_beats(user_id)[:5]
+    if user_beats:
+        lines.append("")
+        lines.append("🎧 Мои биты:")
+        status_labels = {
+            "queued":            "в очереди 🎯",
+            "battling":          "идёт батл ⚔️",
+            "awaiting_decision": "ждёт твоего решения ⏸",
+        }
+        for beat in user_beats:
+            short_id = "#" + beat["id"].split("_")[1]
+            if beat["status"] == "career_finished":
+                lines.append(f"• {short_id} — карьера завершена: {beat['wins']}W {beat['losses']}L {beat['draws']}D")
+            else:
+                lines.append(f"• {short_id} — {status_labels.get(beat['status'], beat['status'])}")
 
     avg_ratings = _profile_average_ratings(user_id, battles_data)
     if avg_ratings:
@@ -930,6 +947,11 @@ def _create_test_users() -> str:
         if _has_active_battle(p1, p2):
             continue
 
+        beat1_id = battles.create_beat(p1, f"TEST_FAKE_FILE_{a}")
+        beat2_id = battles.create_beat(p2, f"TEST_FAKE_FILE_{b_idx}")
+        battles.update_beat_status(beat1_id, "battling")
+        battles.update_beat_status(beat2_id, "battling")
+
         bid        = f"battle_{len(battles_data) + 1}"
         start_time = datetime.now()
         battles_data[bid] = {
@@ -937,6 +959,8 @@ def _create_test_users() -> str:
             "player2":       p2,
             "beat1_file_id": f"TEST_FAKE_FILE_{a}",
             "beat2_file_id": f"TEST_FAKE_FILE_{b_idx}",
+            "beat1_id":      beat1_id,
+            "beat2_id":      beat2_id,
             "votes1":        0,
             "votes2":        0,
             "voters":        {},

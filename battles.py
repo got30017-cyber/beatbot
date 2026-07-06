@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from config import (
     ADMIN_ID, ROOMS, ROOM_LABELS,
-    TICKET_FIRST,
+    TICKET_FIRST, TICKET_CONTINUE, MAX_CAREER_BATTLES,
     NOTIFY_THROTTLE_HOURS,
     FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
     _settings, get_battle_hours,
@@ -18,6 +18,9 @@ from storage import (
     _category_mode_summary,
     add_pair_rating, resolve_pair_ratings,
     get_user_intuition_stats, get_all_intuition_accuracy,
+    create_beat, get_beat, update_beat_status, update_beat_file,
+    record_beat_battle_result, add_predicted_for, finish_beat_career,
+    list_user_beats, find_active_beat_by_user,
 )
 from finals import check_and_start_final
 
@@ -217,6 +220,69 @@ def build_intuition_summary(user_id: str, since_iso: str):
     return "\n".join(lines)
 
 
+# ─── Карьера бита ─────────────────────────────
+
+def _process_beat_career_step(beat_id: str, result: str, predicted_delta: int):
+    """После завершения батла обновляет статистику бита и решает, что показать
+    автору: авто-финал карьеры при достижении лимита, либо экран решения."""
+    record_beat_battle_result(beat_id, result)
+    if predicted_delta:
+        add_predicted_for(beat_id, predicted_delta)
+
+    beat = get_beat(beat_id)
+    if not beat:
+        return
+    author_id = beat["author_id"]
+
+    if beat["battles_played"] >= MAX_CAREER_BATTLES:
+        finish_beat_career(beat_id)
+        try:
+            _bot.send_message(
+                author_id,
+                f"🏁 Карьера твоего бита завершена — сыграны все {MAX_CAREER_BATTLES} батлов.\n\n"
+                f"✅ Побед: {beat['wins']}  ❌ Поражений: {beat['losses']}  🤝 Ничьих: {beat['draws']}\n"
+                f"🧠 За твой бит ставили в прогнозах: {beat['predicted_for']} раз\n\n"
+                f"Спасибо, что участвовал! Бит теперь ждёт конца недели.",
+            )
+        except Exception:
+            pass
+        return
+
+    update_beat_status(beat_id, "awaiting_decision")
+    try:
+        _bot.send_message(
+            author_id,
+            _career_decision_text(beat),
+            reply_markup=_career_decision_markup(beat_id),
+        )
+    except Exception:
+        pass
+
+
+def _predicted_count(predictions: dict, side: str) -> int:
+    return sum(1 for pred_side in predictions.values() if pred_side == side)
+
+
+def _run_beat_career_steps(b: dict, winning_side: int):
+    """winning_side: 1|2|0 (ничья). Обрабатывает оба бита батла, если у них
+    есть beat1_id/beat2_id (старые батлы до этой фичи их не имеют — пропускаем)."""
+    predictions = b.get("predictions", {})
+    beat1_id = b.get("beat1_id")
+    beat2_id = b.get("beat2_id")
+
+    if winning_side == 1:
+        result1, result2 = "win", "loss"
+    elif winning_side == 2:
+        result1, result2 = "loss", "win"
+    else:
+        result1, result2 = "draw", "draw"
+
+    if beat1_id:
+        _process_beat_career_step(beat1_id, result1, _predicted_count(predictions, "1"))
+    if beat2_id:
+        _process_beat_career_step(beat2_id, result2, _predicted_count(predictions, "2"))
+
+
 # ─── Завершение батла ─────────────────────────
 
 def finish_battle(bid: str):
@@ -279,6 +345,7 @@ def finish_battle(bid: str):
                     )
                 except Exception:
                     pass
+        _run_beat_career_steps(b, winning_side)
         return
 
     if winner_id in users:
@@ -326,6 +393,8 @@ def finish_battle(bid: str):
         )
     except Exception:
         pass
+
+    _run_beat_career_steps(b, winning_side)
 
     if room:
         check_and_start_final(room)
@@ -379,6 +448,140 @@ def _force_finish_battle(bid: str, winning_side: int):
     room = b.get("room", "")
     if room:
         check_and_start_final(room)
+
+
+# ─── Решение автора о карьере бита ────────────
+
+def _maybe_resume_career(user_id: str, chat_id):
+    """После оплаты билета продолжения — если у автора есть бит в
+    awaiting_decision, автоматически возвращает его в очередь.
+
+    Бит не хранит свою комнату (в схеме нет такого поля) — на пилоте
+    комната всего одна (ROOMS[0]), поэтому используем её напрямую.
+    """
+    status = ticket_status(user_id)
+    if not status["paid"]:
+        return
+
+    beat = find_active_beat_by_user(user_id)
+    if not beat or beat["status"] != "awaiting_decision":
+        return
+
+    room  = ROOMS[0]
+    queue = load_queue()
+    queue[room][user_id] = beat["file_id"]
+    update_beat_status(beat["id"], "queued")
+    save_queue(queue)
+    consume_ticket(user_id)
+
+    try:
+        _bot.send_message(chat_id, "✅ Билет оплачен — твой бит снова в очереди.")
+    except Exception:
+        pass
+
+
+def _handle_career_continue(call):
+    beat_id = call.data[len("career_continue_"):]
+    user_id = str(call.from_user.id)
+
+    beat = get_beat(beat_id)
+    if not beat or beat["status"] != "awaiting_decision" or beat["author_id"] != user_id:
+        _bot.answer_callback_query(call.id, "Уже неактуально.")
+        return
+
+    _bot.answer_callback_query(call.id)
+    try:
+        _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+    users = load_users()
+    if user_id in users and users[user_id].get("ticket_required", 0) == 0:
+        start_ticket(user_id, TICKET_CONTINUE)
+
+    status = ticket_status(user_id)
+    _bot.send_message(
+        call.message.chat.id,
+        f"▶️ Билет продолжения: оцени {TICKET_CONTINUE} пару, и бит вернётся в бой. "
+        f"Прогресс: {status['progress']}/{status['required']}.",
+    )
+
+
+def _career_decision_text(beat: dict) -> str:
+    return (
+        f"🎧 Карьера твоего бита:\n"
+        f"✅ Побед: {beat['wins']}  ❌ Поражений: {beat['losses']}  🤝 Ничьих: {beat['draws']}\n"
+        f"🧠 За твой бит ставили в прогнозах: {beat['predicted_for']} раз\n"
+        f"🎯 Батлов сыграно: {beat['battles_played']} из {MAX_CAREER_BATTLES}\n\n"
+        f"Что делаем дальше?"
+    )
+
+
+def _career_decision_markup(beat_id: str):
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        telebot.types.InlineKeyboardButton("▶️ Продолжить карьеру", callback_data=f"career_continue_{beat_id}"),
+        telebot.types.InlineKeyboardButton("🏁 Завершить карьеру", callback_data=f"career_finish_{beat_id}"),
+    )
+    return markup
+
+
+def _handle_career_finish(call):
+    beat_id = call.data[len("career_finish_"):]
+    user_id = str(call.from_user.id)
+
+    beat = get_beat(beat_id)
+    if not beat or beat["status"] != "awaiting_decision" or beat["author_id"] != user_id:
+        _bot.answer_callback_query(call.id, "Уже неактуально.")
+        return
+
+    _bot.answer_callback_query(call.id)
+    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        telebot.types.InlineKeyboardButton("✅ Да, завершить", callback_data=f"career_finish_confirm_{beat_id}"),
+        telebot.types.InlineKeyboardButton("🔙 Назад", callback_data=f"career_finish_cancel_{beat_id}"),
+    )
+    text = "🏁 Завершить карьеру этого бита?\n\nЭто необратимо — продолжить потом не получится."
+    try:
+        _bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    except Exception:
+        _bot.send_message(call.message.chat.id, text, reply_markup=markup)
+
+
+def _handle_career_finish_confirm(call):
+    beat_id = call.data[len("career_finish_confirm_"):]
+    user_id = str(call.from_user.id)
+
+    beat = get_beat(beat_id)
+    if not beat or beat["status"] != "awaiting_decision" or beat["author_id"] != user_id:
+        _bot.answer_callback_query(call.id, "Уже неактуально.")
+        return
+
+    finish_beat_career(beat_id)
+    _bot.answer_callback_query(call.id)
+    try:
+        _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    _bot.send_message(call.message.chat.id, "🏁 Карьера бита завершена. Спасибо, что играл! Бит ждёт конца недели.")
+
+
+def _handle_career_finish_cancel(call):
+    beat_id = call.data[len("career_finish_cancel_"):]
+    user_id = str(call.from_user.id)
+
+    beat = get_beat(beat_id)
+    if not beat or beat["status"] != "awaiting_decision" or beat["author_id"] != user_id:
+        _bot.answer_callback_query(call.id, "Уже неактуально.")
+        return
+
+    _bot.answer_callback_query(call.id)
+    text = _career_decision_text(beat)
+    markup = _career_decision_markup(beat_id)
+    try:
+        _bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    except Exception:
+        _bot.send_message(call.message.chat.id, text, reply_markup=markup)
 
 
 # ─── Показ батла для голосования ─────────────
@@ -519,6 +722,7 @@ def _handle_prediction(call):
         save_users(users)
 
     increment_ticket(user_id)
+    _maybe_resume_career(user_id, pending["chat_id"])
 
     try:
         _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
@@ -794,6 +998,29 @@ def _handle_report(call):
     _bot.answer_callback_query(call.id, "⚠️ Жалоба отправлена администратору.")
 
 
+def _beats_have_met(beat_id_a: str, beat_id_b: str) -> bool:
+    battles_data = load_battles()
+    pair = {beat_id_a, beat_id_b}
+    return any(
+        {b.get("beat1_id"), b.get("beat2_id")} == pair
+        for b in battles_data.values()
+        if b.get("status") in ("active", "finished")
+    )
+
+
+def _pick_opponent(my_beat_id: str, candidates: list):
+    """candidates: [(user_id, beat_dict), ...] из очереди той же комнаты.
+
+    Мягкое правило: избегаем соперника, с которым бит уже встречался (finished
+    или active батл между этими beat_id), если есть альтернатива в очереди.
+    Если альтернативы нет — допускаем повтор, это не жёсткий запрет.
+    """
+    if not candidates:
+        return None
+    fresh = [c for c in candidates if not _beats_have_met(my_beat_id, c[1]["id"])]
+    return fresh[0] if fresh else candidates[0]
+
+
 def _send_beat(message):
     user_id = str(message.from_user.id)
     users   = load_users()
@@ -824,6 +1051,14 @@ def _send_beat(message):
             message.chat.id,
             f"⛔️ Дневной лимит исчерпан. Обновится {tomorrow}.\n\n"
             f"{'Pro-подписка даёт 3 батла в день.' if not u.get('is_pro') else ''}",
+            reply_markup=get_menu(user_id),
+        )
+        return
+
+    if find_active_beat_by_user(user_id):
+        _bot.send_message(
+            message.chat.id,
+            "⚠️ У тебя уже есть активный бит. Дождись окончания его карьеры, потом сможешь отправить новый.",
             reply_markup=get_menu(user_id),
         )
         return
@@ -970,8 +1205,19 @@ def _receive_beat(message):
             return
         queue[edit_room][user_id] = file_id
         save_queue(queue)
+        active_beat = find_active_beat_by_user(user_id)
+        if active_beat:
+            update_beat_file(active_beat["id"], file_id)
         vote_context.pop(f"editing_{user_id}", None)
         _bot.send_message(message.chat.id, "✅ Бит обновлён — ждём соперника с новым файлом.", reply_markup=get_menu(user_id))
+        return
+
+    if find_active_beat_by_user(user_id):
+        _bot.send_message(
+            message.chat.id,
+            "⚠️ У тебя уже есть активный бит в системе. Дождись окончания его карьеры.",
+            reply_markup=get_menu(user_id),
+        )
         return
 
     room_key = f"room_{user_id}"
@@ -1016,11 +1262,20 @@ def _receive_beat(message):
         _bot.send_message(message.chat.id, "⏳ Твой бит уже в очереди!", reply_markup=get_menu(user_id))
         return
 
-    waiting = [uid for uid in queue[room] if uid != user_id]
+    beat_id = create_beat(user_id, file_id)
 
-    if waiting:
-        opponent_id   = waiting[0]
-        opponent_beat = queue[room][opponent_id]
+    waiting = [uid for uid in queue[room] if uid != user_id]
+    candidates = []
+    for uid in waiting:
+        cand_beat = find_active_beat_by_user(uid)
+        if cand_beat and cand_beat["status"] == "queued":
+            candidates.append((uid, cand_beat))
+    opponent = _pick_opponent(beat_id, candidates)
+
+    if opponent:
+        opponent_id, opponent_beat_dict = opponent
+        opponent_beat_id = opponent_beat_dict["id"]
+        opponent_beat    = opponent_beat_dict["file_id"]
         del queue[room][opponent_id]
         save_queue(queue)
 
@@ -1033,6 +1288,8 @@ def _receive_beat(message):
             "player2":       user_id,
             "beat1_file_id": opponent_beat,
             "beat2_file_id": file_id,
+            "beat1_id":      opponent_beat_id,
+            "beat2_id":      beat_id,
             "votes1":        0,
             "votes2":        0,
             "voters":        {},
@@ -1044,6 +1301,8 @@ def _receive_beat(message):
             "start_time":    start_time.isoformat(),
         }
         save_battles(battles_data)
+        update_beat_status(opponent_beat_id, "battling")
+        update_beat_status(beat_id, "battling")
 
         _scheduler.add_job(
             finish_battle,
@@ -1201,3 +1460,9 @@ def register_handlers(bot: telebot.TeleBot):
     bot.callback_query_handler(func=lambda c: c.data.startswith("fbcomment_"))(_handle_feedback_comment_btn)
     bot.callback_query_handler(func=lambda c: c.data.startswith("fb_"))(_handle_feedback_rating)
     bot.callback_query_handler(func=lambda c: c.data.startswith("report_"))(_handle_report)
+    # Более специфичные career_finish_confirm_/cancel_ регистрируются раньше
+    # общего career_finish_, иначе он перехватит их (общий префикс).
+    bot.callback_query_handler(func=lambda c: c.data.startswith("career_continue_"))(_handle_career_continue)
+    bot.callback_query_handler(func=lambda c: c.data.startswith("career_finish_confirm_"))(_handle_career_finish_confirm)
+    bot.callback_query_handler(func=lambda c: c.data.startswith("career_finish_cancel_"))(_handle_career_finish_cancel)
+    bot.callback_query_handler(func=lambda c: c.data.startswith("career_finish_"))(_handle_career_finish)
