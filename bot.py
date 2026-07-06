@@ -902,19 +902,74 @@ def _admin_stop_final(fid: str) -> str:
 
 
 def _create_test_users() -> str:
-    users   = load_users()
-    created = []
-    for i in range(1, 6):
+    users        = load_users()
+    battles_data = load_battles()
+
+    def _has_active_battle(p1: str, p2: str) -> bool:
+        return any(
+            b.get("status") == "active" and {b.get("player1"), b.get("player2")} == {p1, p2}
+            for b in battles_data.values()
+        )
+
+    if "test_1" in users and _has_active_battle("test_1", "test_2"):
+        return "ℹ️ Тестовые пользователи и батлы уже существуют.\n\nНажми 🗳 Голосовать, чтобы их увидеть."
+
+    created_users = []
+    for i in range(1, 7):
         uid = f"test_{i}"
         if uid not in users:
             u          = default_user(f"TestBeat{i}")
             u["role"]  = "beatmaker"
             users[uid] = u
-            created.append(f"TestBeat{i}")
+            created_users.append(f"TestBeat{i}")
     save_users(users)
-    if created:
-        return "✅ Тест-пользователи созданы:\n" + "\n".join(f"• {n}" for n in created)
-    return "ℹ️ Все тест-пользователи уже существуют."
+
+    created_battles = 0
+    for a, b_idx in [(1, 2), (3, 4), (5, 6)]:
+        p1, p2 = f"test_{a}", f"test_{b_idx}"
+        if _has_active_battle(p1, p2):
+            continue
+
+        bid        = f"battle_{len(battles_data) + 1}"
+        start_time = datetime.now()
+        battles_data[bid] = {
+            "player1":       p1,
+            "player2":       p2,
+            "beat1_file_id": f"TEST_FAKE_FILE_{a}",
+            "beat2_file_id": f"TEST_FAKE_FILE_{b_idx}",
+            "votes1":        0,
+            "votes2":        0,
+            "voters":        {},
+            "votes":         {},
+            "predictions":   {},
+            "feedback":      {},
+            "status":        "active",
+            "room":          ROOMS[0],
+            "start_time":    start_time.isoformat(),
+        }
+        save_battles(battles_data)
+
+        scheduler.add_job(
+            battles.finish_battle,
+            "date",
+            run_date=start_time + timedelta(hours=get_battle_hours()),
+            args=[bid],
+            id=bid,
+            replace_existing=True,
+        )
+        created_battles += 1
+
+    lines = []
+    if created_users:
+        lines.append(f"✅ Тест-пользователей создано: {len(created_users)}")
+    else:
+        lines.append("ℹ️ Тест-пользователи уже существовали.")
+    if created_battles:
+        lines.append(f"✅ Тестовых батлов создано: {created_battles}")
+    else:
+        lines.append("ℹ️ Тестовые батлы уже существовали.")
+    lines.append("\nНажми 🗳 Голосовать, чтобы их увидеть.")
+    return "\n".join(lines)
 
 
 # ─── Восстановление таймеров ──────────────────
