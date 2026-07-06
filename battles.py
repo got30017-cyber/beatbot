@@ -848,6 +848,32 @@ def _send_beat(message):
     )
 
 
+def _edit_beat(message):
+    """Замена аудиофайла уже стоящего в очереди бита — билет уже оплачен за
+    участие бита, а не за конкретный файл, поэтому замена бесплатна."""
+    user_id = str(message.from_user.id)
+    users   = load_users()
+
+    if user_id not in users:
+        _bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
+        return
+
+    queue = load_queue()
+    room  = user_in_queue(user_id, queue)
+    if not room:
+        _bot.send_message(message.chat.id, "Бит уже не в очереди — редактировать нечего.", reply_markup=get_menu(user_id))
+        return
+
+    vote_context[f"editing_{user_id}"] = room
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("❌ Отменить бит вместо замены", callback_data="cancel_beat"))
+    _bot.send_message(
+        message.chat.id,
+        "✏️ Отправь новый аудиофайл — он заменит текущий бит. Это бесплатно, билет не расходуется.",
+        reply_markup=markup,
+    )
+
+
 def _notify_new_battle(exclude_ids: set):
     users   = load_users()
     now     = datetime.now()
@@ -904,6 +930,8 @@ def _handle_cancel_beat(call):
         _bot.send_message(call.message.chat.id, "Хорошо, бит остаётся в очереди.", reply_markup=get_menu(user_id))
         return
 
+    vote_context.pop(f"editing_{user_id}", None)
+
     queue = load_queue()
     room  = user_in_queue(user_id, queue)
     if room:
@@ -922,6 +950,28 @@ def _receive_beat(message):
 
     if user_id not in users:
         _bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
+        return
+
+    edit_room = vote_context.get(f"editing_{user_id}")
+    if edit_room:
+        queue = load_queue()
+        if user_in_queue(user_id, queue) != edit_room:
+            vote_context.pop(f"editing_{user_id}", None)
+            _bot.send_message(message.chat.id, "⏳ Бит уже не в очереди — редактирование отменено.", reply_markup=get_menu(user_id))
+            return
+        if message.audio:
+            file_id = message.audio.file_id
+        elif message.voice:
+            file_id = message.voice.file_id
+        elif message.document:
+            file_id = message.document.file_id
+        else:
+            _bot.send_message(message.chat.id, "Пришли аудиофайл, чтобы заменить бит.")
+            return
+        queue[edit_room][user_id] = file_id
+        save_queue(queue)
+        vote_context.pop(f"editing_{user_id}", None)
+        _bot.send_message(message.chat.id, "✅ Бит обновлён — ждём соперника с новым файлом.", reply_markup=get_menu(user_id))
         return
 
     room_key = f"room_{user_id}"
@@ -1137,9 +1187,8 @@ def _my_battle(message):
 # ─── Регистрация хэндлеров ───────────────────
 
 def register_handlers(bot: telebot.TeleBot):
-    bot.message_handler(
-        func=lambda m: m.text in ["🎵 Отправить бит", "✏️ Редактировать бит"]
-    )(_send_beat)
+    bot.message_handler(func=lambda m: m.text == "🎵 Отправить бит")(_send_beat)
+    bot.message_handler(func=lambda m: m.text == "✏️ Редактировать бит")(_edit_beat)
     bot.message_handler(func=lambda m: m.text == "⚔️ Мой батл")(_my_battle)
     bot.message_handler(func=lambda m: m.text == "🗳 Голосовать")(_vote_menu)
     bot.message_handler(content_types=["audio", "voice", "document"])(_receive_beat)
