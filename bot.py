@@ -6,7 +6,6 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from config import (
     TOKEN, ADMIN_ID,
     ROOMS, ROOM_LABELS,
-    COINS_MAX, BEAT_COST_FREE, BEAT_COST_PRO,
     DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
     BATTLE_HOURS, FINAL_HOURS,
     MESSAGE_DAILY_LIMIT, MESSAGE_COOLDOWN_MINUTES,
@@ -45,7 +44,6 @@ finals.register_handlers(bot)
 
 # ─── Сессии ──────────────────────────────────
 msg_pending    = {}   # user_id -> target_user_id
-admin_session  = {}   # admin_id -> target_uid (флоу начисления монет)
 last_message_to = {}  # (sender_uid, target_uid) -> datetime, не персистится
 
 _NICKNAME_RE = re.compile(r'^[\w ]+$', re.UNICODE)
@@ -61,18 +59,18 @@ _ONBOARD = [
     ),
     (
         "⚔️ Как работают батлы?\n\n"
-        "1. Загружаешь бит — тратишь монеты\n"
-        "2. Бот автоматически находит соперника\n"
-        "3. Слушатели голосуют анонимно\n"
-        "4. Победитель получает +10 к рейтингу и монеты\n\n"
+        "1. Загружаешь бит — бот находит соперника\n"
+        "2. Слушатели голосуют анонимно и угадывают, что выберет большинство\n"
+        "3. Победитель получает +10 к рейтингу\n\n"
         "Накопи 3 победы → попади в финальный турнир!"
     ),
     (
-        "🪙 Монеты и рейтинг\n\n"
-        "• Голосуй в батлах → +1 монета за каждый голос, +1 рейтинг если угадал победителя\n"
-        "• Побеждай батлы → +10 к рейтингу\n"
-        "• Выиграй финал → +100 к рейтингу и бейдж 👑 Легенда\n\n"
-        "Готов начать? Создай профиль!"
+        "🎧 Как получить фидбек?\n\n"
+        "Чтобы твой бит вступил в батл, оцени несколько чужих пар. "
+        "Это честный обмен вниманием: ты слушаешь → тебя слушают.\n\n"
+        "• Побеждай в батлах → +10 к рейтингу\n"
+        "• Выиграй финал → +100 и бейдж 👑 Легенда\n\n"
+        "Готов? Создай профиль!"
     ),
 ]
 
@@ -221,13 +219,19 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
         f"👤 {u['nickname']} ({pro_str})",
         f"{badge}\n",
         f"⭐️ Рейтинг: {u.get('rating', 0)}",
-        f"🪙 Монеты: {u.get('coins', 0)}/{COINS_MAX}",
         f"✅ Побед: {u.get('wins', 0)}",
         f"🏆 Финальных побед: {u.get('final_wins', 0)}",
     ]
     if best_wins > 0:
         lines.append(f"🎯 Лучшая комната: {ROOM_LABELS[best_room]} ({best_wins} побед)")
     lines.append(f"⚔️ Батлов сегодня осталось: {battles_left}")
+
+    ticket_status = battles.ticket_status(user_id)
+    if ticket_status["active"]:
+        if ticket_status["paid"]:
+            lines.append("✅ Билет оплачен")
+        else:
+            lines.append(f"🎧 Билет: {ticket_status['progress']}/{ticket_status['required']} пар оценено")
 
     avg_ratings = _profile_average_ratings(user_id, battles_data)
     if avg_ratings:
@@ -400,7 +404,7 @@ def cmd_help(message):
         "🗳 Слушатели слушают оба бита анонимно и голосуют за лучший, "
         "потом угадывают выбор большинства.\n"
         "🏆 Лучшие биты раунда попадают в финал — финальное голосование определяет чемпиона.\n"
-        "🪙 Монеты нужны для отправки бита, зарабатываются за голосование.\n"
+        "🎧 Чтобы отправить свой бит в батл, сначала оцени несколько чужих пар — это входной билет.\n"
         "⭐️ Рейтинг растёт за победы в батлах и финалах.\n\n"
         "Команды: /start, /profile, /rating, /winners, /final, /help\n\n"
         "Что-то сломалось или не так? Нажми ⚠️ под битом, чтобы пожаловаться, "
@@ -583,7 +587,6 @@ def admin_panel(message):
     markup.add(
         telebot.types.InlineKeyboardButton("🛑 Остановить раунд",  callback_data="admin_stop_round"),
         telebot.types.InlineKeyboardButton("🏆 Остановить финал",  callback_data="admin_stop_final"),
-        telebot.types.InlineKeyboardButton("💰 Начислить монеты",  callback_data="admin_add_coins"),
         telebot.types.InlineKeyboardButton("👤 Тест-пользователи", callback_data="admin_test_users"),
         telebot.types.InlineKeyboardButton("⏱ Время батлов",       callback_data="admin_set_time"),
         telebot.types.InlineKeyboardButton("🏆 Порог финала",       callback_data="admin_set_threshold"),
@@ -645,11 +648,6 @@ def handle_admin_actions(call):
         )
         bot.register_next_step_handler(call.message, _admin_time_step1)
 
-    elif call.data == "admin_add_coins":
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "💰 Начисление монет\n\nВведи Telegram ID пользователя:")
-        bot.register_next_step_handler(call.message, _admin_coins_step1)
-
     elif call.data == "admin_test_users":
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, _create_test_users())
@@ -688,54 +686,6 @@ def handle_admin_actions(call):
 
 
 # ─── Шаговые хэндлеры админа ─────────────────
-
-def _admin_coins_step1(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not message.text:
-        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
-        return
-    uid   = message.text.strip()
-    users = load_users()
-    if uid not in users:
-        bot.send_message(message.chat.id, "❌ Пользователь не найден.")
-        return
-    u = users[uid]
-    admin_session[str(message.from_user.id)] = uid
-    bot.send_message(
-        message.chat.id,
-        f"👤 {u['nickname']}\n"
-        f"Текущий баланс: {u.get('coins', 0)}/{COINS_MAX} монет\n\n"
-        f"Сколько монет начислить?",
-    )
-    bot.register_next_step_handler(message, _admin_coins_step2)
-
-
-def _admin_coins_step2(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not message.text:
-        bot.send_message(message.chat.id, "Отправь текстовое сообщение.")
-        return
-    admin_uid  = str(message.from_user.id)
-    target_uid = admin_session.pop(admin_uid, None)
-    if not target_uid:
-        bot.send_message(message.chat.id, "Сессия устарела — начни заново через /admin.")
-        return
-    try:
-        amount = int(message.text.strip())
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Введи целое число.")
-        return
-    users = load_users()
-    if target_uid not in users:
-        bot.send_message(message.chat.id, "❌ Пользователь не найден.")
-        return
-    u          = users[target_uid]
-    u["coins"] = min(u.get("coins", 0) + amount, COINS_MAX)
-    save_users(users)
-    bot.send_message(message.chat.id, f"✅ Готово. @{u['nickname']} теперь имеет {u['coins']} монет.")
-
 
 def _admin_time_step1(message):
     if message.from_user.id != ADMIN_ID:
@@ -836,10 +786,8 @@ def _admin_stop_round() -> str:
         for uid_str, voted_side in b.get("votes", {}).items():
             if uid_str not in users:
                 continue
-            u = users[uid_str]
-            u["coins"] = min(u.get("coins", 0) + 1, COINS_MAX)
             if winning_side and voted_side == str(winning_side):
-                u["rating"] = u.get("rating", 0) + 1
+                users[uid_str]["rating"] = users[uid_str].get("rating", 0) + 1
 
         try:
             scheduler.remove_job(bid)
@@ -873,11 +821,8 @@ def _admin_stop_round() -> str:
 
     for room in ROOMS:
         for uid in list(queue[room].keys()):
-            if uid in users:
-                cost = BEAT_COST_PRO if users[uid].get("is_pro") else BEAT_COST_FREE
-                users[uid]["coins"] = min(users[uid].get("coins", 0) + cost, COINS_MAX)
             try:
-                bot.send_message(uid, "🛑 Раунд остановлен. Твой бит удалён, монеты возвращены.")
+                bot.send_message(uid, "🛑 Раунд остановлен. Твой бит удалён из очереди.")
             except Exception:
                 pass
 
@@ -964,7 +909,6 @@ def _create_test_users() -> str:
         if uid not in users:
             u          = default_user(f"TestBeat{i}")
             u["role"]  = "beatmaker"
-            u["coins"] = 5
             users[uid] = u
             created.append(f"TestBeat{i}")
     save_users(users)

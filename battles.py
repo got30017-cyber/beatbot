@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from config import (
     ADMIN_ID, ROOMS, ROOM_LABELS,
-    COINS_MAX, BEAT_COST_FREE, BEAT_COST_PRO,
+    TICKET_FIRST,
     NOTIFY_THROTTLE_HOURS,
     FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
     _settings, get_battle_hours,
@@ -41,6 +41,56 @@ def init(bot: telebot.TeleBot, scheduler):
     global _bot, _scheduler
     _bot       = bot
     _scheduler = scheduler
+
+
+# ─── Входной билет ────────────────────────────
+# Билет — состояние в самом пользователе (ticket_progress/ticket_required),
+# отдельной таблицы не заводим. Тонкие обёртки над load_users/save_users.
+
+def ticket_status(user_id: str) -> dict:
+    users    = load_users()
+    u        = users.get(user_id, {})
+    required = u.get("ticket_required", 0)
+    progress = u.get("ticket_progress", 0)
+    active   = required > 0
+    paid     = active and progress >= required
+    return {"active": active, "progress": progress, "required": required, "paid": paid}
+
+
+def start_ticket(user_id: str, required: int):
+    """Активирует билет с нужным числом пар. Обнуляет progress."""
+    users = load_users()
+    if user_id not in users:
+        return
+    users[user_id]["ticket_required"] = required
+    users[user_id]["ticket_progress"] = 0
+    save_users(users)
+
+
+def increment_ticket(user_id: str):
+    """Вызывается после каждого подтверждённого прогноза.
+
+    Инкрементит progress, если билет активен и не оплачен.
+    """
+    users = load_users()
+    u     = users.get(user_id)
+    if not u:
+        return
+    required = u.get("ticket_required", 0)
+    progress = u.get("ticket_progress", 0)
+    if required > 0 and progress < required:
+        u["ticket_progress"] = progress + 1
+        save_users(users)
+
+
+def consume_ticket(user_id: str):
+    """Сбрасывает билет после успешной отправки бита в очередь."""
+    users = load_users()
+    if user_id not in users:
+        return
+    users[user_id]["ticket_required"] = 0
+    users[user_id]["ticket_progress"] = 0
+    save_users(users)
 
 
 # ─── Вспомогательные функции голосования ─────
@@ -108,6 +158,26 @@ def _feedback_summary_text(b: dict, side: str):
         rating = summary.get(cat_key)
         if rating:
             lines.append(f"{cat_label}: {RATING_EMOJI[rating]} {RATING_LABELS[rating]}")
+    return "\n".join(lines)
+
+
+def _feedback_comments_text(b: dict):
+    """Последние анонимные комментарии слушателей к паре (без привязки к автору).
+
+    Комментарий пишется один раз за карточку и не различается по стороне —
+    поэтому собирается общий список, а не отдельно для каждого бита.
+    """
+    feedback = b.get("feedback") or {}
+    comments = [
+        entry["comment"].strip()[:200]
+        for entry in feedback.values()
+        if entry.get("comment", "").strip()
+    ]
+    if not comments:
+        return None
+    lines = ["💬 Комментарии слушателей:"]
+    for c in comments[-3:]:
+        lines.append(f"— \"{c}\"")
     return "\n".join(lines)
 
 
@@ -184,11 +254,6 @@ def finish_battle(bid: str):
 
     resolve_pair_ratings(bid, str(winning_side))
 
-    # +1 монета всем проголосовавшим (за участие в голосовании)
-    for uid_str in b.get("votes", {}):
-        if uid_str in users:
-            users[uid_str]["coins"] = min(users[uid_str].get("coins", 0) + 1, COINS_MAX)
-
     # +1 рейтинг тем, чей ПРОГНОЗ совпал с победившей стороной.
     # Награда перенесена с голоса на прогноз: награда за «правильный» голос
     # стимулирует голосовать за фаворита, а не честно; прогноз — честное угадывание.
@@ -232,6 +297,7 @@ def finish_battle(bid: str):
 
     winner_summary = _feedback_summary_text(b, winner_side)
     loser_summary  = _feedback_summary_text(b, loser_side)
+    comments_text  = _feedback_comments_text(b)
 
     try:
         _bot.send_message(
@@ -242,7 +308,8 @@ def finish_battle(bid: str):
             f"🎵 {loser_nick} — {loser_votes} гол. ({loser_pct}%)\n\n"
             f"📊 Всего голосов: {total}\n"
             f"⭐️ Твой рейтинг: {new_rating} (+10)"
-            + (f"\n\n{winner_summary}" if winner_summary else ""),
+            + (f"\n\n{winner_summary}" if winner_summary else "")
+            + (f"\n\n{comments_text}" if comments_text else ""),
         )
     except Exception:
         pass
@@ -254,7 +321,8 @@ def finish_battle(bid: str):
             f"🎵 {winner_nick} — {winner_votes} гол. ({winner_pct}%)\n"
             f"🎵 {loser_nick} — {loser_votes} гол. ({loser_pct}%)\n\n"
             f"📊 Всего голосов: {total}"
-            + (f"\n\n{loser_summary}" if loser_summary else ""),
+            + (f"\n\n{loser_summary}" if loser_summary else "")
+            + (f"\n\n{comments_text}" if comments_text else ""),
         )
     except Exception:
         pass
@@ -450,6 +518,8 @@ def _handle_prediction(call):
         users[user_id]["votes_this_round"] = vtr
         save_users(users)
 
+    increment_ticket(user_id)
+
     try:
         _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
     except Exception:
@@ -476,6 +546,14 @@ def _send_vote_summary(chat_id, user_id: str, bid: str, vote_side: str, pred_sid
         f"🧠 Твой прогноз: Бит {pred_side} — {pred_nick}\n\n"
         f"Угадал ли ты мнение большинства — узнаешь в конце финала. 🤫"
     )
+
+    status = ticket_status(user_id)
+    if status["active"]:
+        if status["paid"]:
+            text += "\n\n✅ Билет оплачен! Теперь можешь загрузить бит — нажми 🎵 Отправить бит."
+        else:
+            text += f"\n\n🎧 Прогресс билета: {status['progress']}/{status['required']}"
+
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.row(
         telebot.types.InlineKeyboardButton("▶️ Следующая пара", callback_data=f"nextpair_{bid}"),
@@ -515,7 +593,7 @@ def _handle_feedback_open(call):
     battles_data = load_battles()
     b = battles_data.get(bid)
     if not b or b["status"] != "active":
-        _bot.answer_callback_query(call.id, "Батл уже завершён.")
+        _bot.answer_callback_query(call.id, "Батл уже завершён, карточку оставить нельзя.")
         return
 
     if user_id in b.get("feedback", {}):
@@ -726,9 +804,8 @@ def _send_beat(message):
 
     u = users[user_id]
 
-    # Проверка "уже в очереди" идёт раньше лимита/монет — иначе юзер,
-    # потративший последние монеты на бит в очереди, не сможет добраться до
-    # кнопки отмены (а значит и до возврата монет), упираясь в "не хватает монет".
+    # Проверка "уже в очереди" идёт раньше остальных гейтов — иначе юзер не
+    # сможет добраться до кнопки отмены, упираясь в лимит/билет.
     queue = load_queue()
     if user_in_queue(user_id, queue):
         markup = telebot.types.InlineKeyboardMarkup()
@@ -742,7 +819,6 @@ def _send_beat(message):
     exhausted, _ = check_daily_limit(u)
     save_users(users)
     if exhausted:
-        from datetime import timedelta
         tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m в 00:00")
         _bot.send_message(
             message.chat.id,
@@ -752,23 +828,23 @@ def _send_beat(message):
         )
         return
 
-    cost  = BEAT_COST_PRO if u.get("is_pro") else BEAT_COST_FREE
-    coins = u.get("coins", 0)
-    if coins < cost:
-        need = cost - coins
-        _bot.send_message(
-            message.chat.id,
-            f"🪙 Не хватает монет.\nНужно: {cost}, у тебя: {coins} (ещё нужно: {need})\n\n"
-            f"Голосуй в батлах — каждый голос даёт +1 монету.\nНажми 🗳 Голосовать",
-            reply_markup=get_menu(user_id),
-        )
+    # Активируем билет только если он ещё не начат — не сбрасываем прогресс
+    # уже начавшего платить пользователя.
+    if u.get("ticket_required", 0) == 0:
+        start_ticket(user_id, TICKET_FIRST)
+
+    status = ticket_status(user_id)
+    if status["paid"]:
+        vote_context[f"room_{user_id}"] = ROOMS[0]
+        _bot.send_message(message.chat.id, "🎵 Отправь аудиофайл с битом:")
         return
 
-    # Одна комната на старте — сразу просим аудиофайл, без шага выбора жанра
-    vote_context[f"room_{user_id}"] = ROOMS[0]
     _bot.send_message(
         message.chat.id,
-        f"🎵 Отправь аудиофайл с битом:\n\n(Стоимость: {cost} монеты, у тебя: {coins})",
+        f"🎧 Чтобы твой бит вступил в батл, оцени {status['required']} чужих пар.\n\n"
+        f"Прогресс: {status['progress']}/{status['required']}\n\n"
+        f"Нажми 🗳 Голосовать, чтобы начать.",
+        reply_markup=get_menu(user_id),
     )
 
 
@@ -833,13 +909,8 @@ def _handle_cancel_beat(call):
     if room:
         del queue[room][user_id]
         save_queue(queue)
-        users = load_users()
-        if user_id in users:
-            cost = BEAT_COST_PRO if users[user_id].get("is_pro") else BEAT_COST_FREE
-            users[user_id]["coins"] = min(users[user_id].get("coins", 0) + cost, COINS_MAX)
-            save_users(users)
-        _bot.answer_callback_query(call.id, "Бит отменён, монеты возвращены!")
-        _bot.send_message(call.message.chat.id, "✅ Бит удалён. Монеты возвращены.", reply_markup=get_menu(user_id))
+        _bot.answer_callback_query(call.id, "Бит отменён.")
+        _bot.send_message(call.message.chat.id, "✅ Бит удалён из очереди.", reply_markup=get_menu(user_id))
     else:
         _bot.answer_callback_query(call.id, "Бит уже не в очереди.")
         _bot.send_message(call.message.chat.id, "Бит уже не в очереди.", reply_markup=get_menu(user_id))
@@ -863,16 +934,24 @@ def _receive_beat(message):
         )
         return
 
-    u = users[user_id]
-    exhausted, _ = check_daily_limit(u)
-    cost  = BEAT_COST_PRO if u.get("is_pro") else BEAT_COST_FREE
-    coins = u.get("coins", 0)
-    if exhausted or coins < cost:
+    status = ticket_status(user_id)
+    if not status["paid"]:
         vote_context.pop(room_key, None)
-        _bot.send_message(message.chat.id, "⛔️ Условия изменились — проверь лимит и монеты.", reply_markup=get_menu(user_id))
+        _bot.send_message(
+            message.chat.id,
+            f"⚠️ Сначала оплати билет: оцени {status['required']} пар.\n"
+            f"Прогресс: {status['progress']}/{status['required']}.",
+            reply_markup=get_menu(user_id),
+        )
         return
 
-    u["coins"] = coins - cost
+    u = users[user_id]
+    exhausted, _ = check_daily_limit(u)
+    if exhausted:
+        vote_context.pop(room_key, None)
+        _bot.send_message(message.chat.id, "⛔️ Условия изменились — дневной лимит исчерпан.", reply_markup=get_menu(user_id))
+        return
+
     vote_context.pop(room_key, None)
 
     if message.audio:
@@ -935,6 +1014,7 @@ def _receive_beat(message):
                 users[pid]["votes_this_round"] = []
 
         save_users(users)
+        consume_ticket(user_id)
 
         p1_nick    = users.get(opponent_id, {}).get("nickname", "Соперник")
         p2_nick    = users.get(user_id, {}).get("nickname", "Ты")
@@ -961,9 +1041,10 @@ def _receive_beat(message):
         save_queue(queue)
         u["votes_this_round"] = []
         save_users(users)
+        consume_ticket(user_id)
         _bot.send_message(
             message.chat.id,
-            f"✅ Бит принят! {ROOM_LABELS[room]}\nЖдём соперника... ⏳\nМонеты списаны: -{cost} 🪙",
+            f"✅ Бит принят! {ROOM_LABELS[room]}\nЖдём соперника... ⏳",
             reply_markup=get_menu(user_id),
         )
 
@@ -988,9 +1069,17 @@ def _vote_menu(message):
         )
         return
 
+    status      = ticket_status(user_id)
+    ticket_line = ""
+    if status["active"]:
+        if status["paid"]:
+            ticket_line = "✅ Билет оплачен — можешь загружать бит.\n\n"
+        else:
+            ticket_line = f"🎧 Билет: {status['progress']}/{status['required']} пар оценено.\n\n"
+
     _bot.send_message(
         message.chat.id,
-        f"🗳 Батлов для голосования: {len(not_voted)}\n\n"
+        f"{ticket_line}🗳 Батлов для голосования: {len(not_voted)}\n\n"
         f"Слушай оба бита, реши какой сильнее — а потом угадай, что выберет большинство. 🎧",
     )
     send_next_battle_for_vote(message.chat.id, user_id, not_voted)

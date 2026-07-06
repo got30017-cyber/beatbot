@@ -6,8 +6,7 @@ from datetime import datetime
 
 from config import (
     BASE_DIR, DB_FILE,
-    ROOMS, ROOM_LABELS, COINS_MAX, DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
-    BEAT_COST_FREE, BEAT_COST_PRO,
+    ROOMS, ROOM_LABELS, DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
     FEEDBACK_CATEGORIES, RATING_POINTS,
 )
 
@@ -36,6 +35,8 @@ def _ensure_user_columns(conn: sqlite3.Connection):
         "messages_sent_today": "INTEGER DEFAULT 0",
         "last_message_date":   "TEXT",
         "last_notified_at":    "TEXT",
+        "ticket_progress":     "INTEGER DEFAULT 0",
+        "ticket_required":     "INTEGER DEFAULT 0",
     }
     for col, decl in new_columns.items():
         if col not in existing:
@@ -77,7 +78,9 @@ def init_db():
                     votes_this_round      TEXT DEFAULT '[]',
                     messages_sent_today   INTEGER DEFAULT 0,
                     last_message_date     TEXT,
-                    last_notified_at      TEXT
+                    last_notified_at      TEXT,
+                    ticket_progress       INTEGER DEFAULT 0,
+                    ticket_required       INTEGER DEFAULT 0
                 )
             """)
             _ensure_user_columns(conn)
@@ -215,7 +218,6 @@ def load_users() -> dict:
             "nickname":            row["nickname"],
             "role":                row["role"],
             "rating":              row["rating"],
-            "coins":               row["coins"],
             "wins":                row["wins"],
             "final_wins":          row["final_wins"],
             "battles_today":       row["battles_today"],
@@ -226,6 +228,8 @@ def load_users() -> dict:
             "messages_sent_today": row["messages_sent_today"] or 0,
             "last_message_date":   row["last_message_date"],
             "last_notified_at":    row["last_notified_at"],
+            "ticket_progress":     row["ticket_progress"] or 0,
+            "ticket_required":     row["ticket_required"] or 0,
         }
         for row in rows
     }
@@ -238,17 +242,17 @@ def save_users(users: dict):
             conn.execute("DELETE FROM users")
             conn.executemany(
                 """INSERT INTO users
-                   (id, nickname, role, rating, coins, wins, final_wins,
+                   (id, nickname, role, rating, wins, final_wins,
                     battles_today, last_battle_date, is_pro, bio, votes_this_round,
-                    messages_sent_today, last_message_date, last_notified_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    messages_sent_today, last_message_date, last_notified_at,
+                    ticket_progress, ticket_required)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         uid,
                         u.get("nickname"),
                         u.get("role"),
                         u.get("rating", 0),
-                        u.get("coins", 0),
                         u.get("wins", 0),
                         u.get("final_wins", 0),
                         u.get("battles_today", 0),
@@ -259,6 +263,8 @@ def save_users(users: dict):
                         u.get("messages_sent_today", 0),
                         u.get("last_message_date"),
                         u.get("last_notified_at"),
+                        u.get("ticket_progress", 0),
+                        u.get("ticket_required", 0),
                     )
                     for uid, u in users.items()
                 ],
@@ -584,7 +590,6 @@ def default_user(nickname: str) -> dict:
         "nickname":            nickname,
         "role":                None,
         "rating":              0,
-        "coins":               3,
         "wins":                0,
         "final_wins":          0,
         "battles_today":       0,
@@ -595,6 +600,8 @@ def default_user(nickname: str) -> dict:
         "messages_sent_today": 0,
         "last_message_date":   None,
         "last_notified_at":    None,
+        "ticket_progress":     0,
+        "ticket_required":     0,
     }
 
 
