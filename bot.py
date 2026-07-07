@@ -10,6 +10,7 @@ from config import (
     BATTLE_HOURS, FINAL_HOURS,
     MESSAGE_DAILY_LIMIT, MESSAGE_COOLDOWN_MINUTES,
     FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
+    REFERRAL_RATING_BONUS,
     _settings,
     get_battle_hours, get_final_hours, get_final_threshold,
 )
@@ -25,6 +26,7 @@ from storage import (
     _category_mode_summary,
     list_user_beats,
     get_current_week,
+    set_referred_by,
 )
 import battles
 import weeks
@@ -34,8 +36,9 @@ init_db()
 migrate_from_json()
 
 # ─── Создание экземпляров ────────────────────
-bot       = telebot.TeleBot(TOKEN)
-scheduler = BackgroundScheduler()
+bot          = telebot.TeleBot(TOKEN)
+BOT_USERNAME = bot.get_me().username  # кешируем — не дёргать API на каждый /invite
+scheduler    = BackgroundScheduler()
 scheduler.start()
 
 battles.init(bot, scheduler)
@@ -47,6 +50,9 @@ weeks.register_handlers(bot)
 # ─── Сессии ──────────────────────────────────
 msg_pending    = {}   # user_id -> target_user_id
 last_message_to = {}  # (sender_uid, target_uid) -> datetime, не персистится
+_pending_referrer = {}  # user_id -> referrer_id, до завершения регистрации
+                        # (в момент /start строки пользователя в БД ещё нет —
+                        # set_referred_by на несуществующий id был бы no-op)
 
 _NICKNAME_RE = re.compile(r'^[\w ]+$', re.UNICODE)
 
@@ -83,6 +89,17 @@ _ONBOARD = [
 def cmd_start(message):
     users   = load_users()
     user_id = str(message.from_user.id)
+
+    # Deep link: t.me/<bot>?start=ref_<referrer_id> — Telegram передаёт это как
+    # "/start ref_<id>" одной строкой. Строки пользователя в БД ещё нет (она
+    # появится только после save_nickname), поэтому реферера пока просто
+    # запоминаем в памяти и применяем через set_referred_by уже после
+    # регистрации. Не перезаписываем при повторном /start зарегистрированного.
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("ref_") and user_id not in users:
+        referrer_id = parts[1][len("ref_"):]
+        if referrer_id != user_id and referrer_id in users:
+            _pending_referrer[user_id] = referrer_id
 
     if user_id in users and users[user_id].get("role"):
         bot.send_message(
@@ -148,6 +165,10 @@ def save_nickname(message):
     users[user_id] = default_user(nickname)
     users[user_id]["role"] = "beatmaker"   # технический дефолт — роли больше не выбираются
     save_users(users)
+
+    referrer_id = _pending_referrer.pop(user_id, None)
+    if referrer_id:
+        set_referred_by(user_id, referrer_id)
 
     bot.send_message(
         message.chat.id,
@@ -232,6 +253,9 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
             lines.append("✅ Билет оплачен")
         else:
             lines.append(f"🎧 Билет: {ticket_status['progress']}/{ticket_status['required']} пар оценено")
+
+    if u.get("referral_count", 0) > 0:
+        lines.append(f"🤝 Приглашено друзей: {u.get('referral_count', 0)}")
 
     user_beats = list_user_beats(user_id)[:5]
     if user_beats:
@@ -422,9 +446,33 @@ def cmd_help(message):
         "на 48-часовое голосование всего сообщества.\n"
         "🎧 Чтобы отправить свой бит в батл, сначала оцени несколько чужих пар — это входной билет.\n"
         "⭐️ Рейтинг растёт за победы в батлах и за победу в Бите недели.\n\n"
-        "Команды: /start, /profile, /rating, /week, /help\n\n"
+        "Команды: /start, /profile, /rating, /week, /invite, /help\n\n"
         "Что-то сломалось? Нажми ⚠️ под битом, чтобы пожаловаться, "
         "либо напиши мне напрямую.",
+    )
+
+
+# ─── Реферальная система ──────────────────────
+
+@bot.message_handler(commands=["invite"])
+@bot.message_handler(func=lambda m: m.text == "🤝 Пригласить друга")
+def cmd_invite(message):
+    user_id = str(message.from_user.id)
+    users   = load_users()
+
+    if user_id not in users:
+        bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
+        return
+
+    link  = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+    count = users[user_id].get("referral_count", 0)
+    bot.send_message(
+        message.chat.id,
+        f"🤝 Приглашай друзей!\n\n"
+        f"Твоя ссылка:\n{link}\n\n"
+        f"За каждого друга, который сыграет свой первый батл, "
+        f"ты получаешь +{REFERRAL_RATING_BONUS} к рейтингу и скидку на билет.\n\n"
+        f"Приглашено друзей: {count}",
     )
 
 

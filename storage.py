@@ -8,6 +8,7 @@ from config import (
     BASE_DIR, DB_FILE,
     ROOMS, ROOM_LABELS, DAILY_LIMIT_FREE, DAILY_LIMIT_PRO,
     FEEDBACK_CATEGORIES, RATING_POINTS,
+    REFERRAL_RATING_BONUS, REFERRAL_TICKET_DISCOUNT,
 )
 
 # ─── Легаси JSON-файлы (только для одноразовой миграции) ──
@@ -38,6 +39,10 @@ def _ensure_user_columns(conn: sqlite3.Connection):
         "ticket_progress":     "INTEGER DEFAULT 0",
         "ticket_required":     "INTEGER DEFAULT 0",
         "last_weekly_vote":    "TEXT",
+        "referred_by":         "TEXT",
+        "referral_rewarded":   "INTEGER DEFAULT 0",
+        "referral_count":      "INTEGER DEFAULT 0",
+        "ticket_discount":     "INTEGER DEFAULT 0",
     }
     for col, decl in new_columns.items():
         if col not in existing:
@@ -110,7 +115,11 @@ def init_db():
                     last_notified_at      TEXT,
                     ticket_progress       INTEGER DEFAULT 0,
                     ticket_required       INTEGER DEFAULT 0,
-                    last_weekly_vote      TEXT
+                    last_weekly_vote      TEXT,
+                    referred_by           TEXT,
+                    referral_rewarded     INTEGER DEFAULT 0,
+                    referral_count        INTEGER DEFAULT 0,
+                    ticket_discount       INTEGER DEFAULT 0
                 )
             """)
             _ensure_user_columns(conn)
@@ -304,6 +313,10 @@ def load_users() -> dict:
             "ticket_progress":     row["ticket_progress"] or 0,
             "ticket_required":     row["ticket_required"] or 0,
             "last_weekly_vote":    row["last_weekly_vote"],
+            "referred_by":         row["referred_by"],
+            "referral_rewarded":   bool(row["referral_rewarded"]),
+            "referral_count":      row["referral_count"] or 0,
+            "ticket_discount":     row["ticket_discount"] or 0,
         }
         for row in rows
     }
@@ -319,8 +332,9 @@ def save_users(users: dict):
                    (id, nickname, role, rating, wins, final_wins,
                     battles_today, last_battle_date, is_pro, bio, votes_this_round,
                     messages_sent_today, last_message_date, last_notified_at,
-                    ticket_progress, ticket_required, last_weekly_vote)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ticket_progress, ticket_required, last_weekly_vote,
+                    referred_by, referral_rewarded, referral_count, ticket_discount)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         uid,
@@ -340,6 +354,10 @@ def save_users(users: dict):
                         u.get("ticket_progress", 0),
                         u.get("ticket_required", 0),
                         u.get("last_weekly_vote"),
+                        u.get("referred_by"),
+                        int(bool(u.get("referral_rewarded"))),
+                        u.get("referral_count", 0),
+                        u.get("ticket_discount", 0),
                     )
                     for uid, u in users.items()
                 ],
@@ -958,7 +976,70 @@ def default_user(nickname: str) -> dict:
         "ticket_progress":     0,
         "ticket_required":     0,
         "last_weekly_vote":    None,
+        "referred_by":         None,
+        "referral_rewarded":   False,
+        "referral_count":      0,
+        "ticket_discount":     0,
     }
+
+
+# ─── Реферальная система ─────────────────────
+# Точечные операции — не гоняем весь users через load-all/save-all ради одного поля.
+
+def set_referred_by(user_id: str, referrer_id: str):
+    """Проставляет referred_by только если сейчас NULL — защита от повторной
+    привязки (например, если пользователь позже перейдёт по чужой ссылке)."""
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE users SET referred_by = ? WHERE id = ? AND referred_by IS NULL",
+                (referrer_id, user_id),
+            )
+    finally:
+        conn.close()
+
+
+def mark_referral_rewarded(user_id: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE users SET referral_rewarded = 1 WHERE id = ?", (user_id,))
+    finally:
+        conn.close()
+
+
+def add_referral_reward(referrer_id: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE users SET rating = rating + ?, referral_count = referral_count + 1, "
+                "ticket_discount = ticket_discount + ? WHERE id = ?",
+                (REFERRAL_RATING_BONUS, REFERRAL_TICKET_DISCOUNT, referrer_id),
+            )
+    finally:
+        conn.close()
+
+
+def pop_ticket_discount(user_id: str) -> int:
+    """Если ticket_discount > 0, уменьшает на 1 и возвращает 1 (скидка
+    применена), иначе возвращает 0 без изменений."""
+    conn = _connect()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT ticket_discount FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if not row or (row["ticket_discount"] or 0) <= 0:
+                return 0
+            conn.execute(
+                "UPDATE users SET ticket_discount = ticket_discount - 1 WHERE id = ?",
+                (user_id,),
+            )
+    finally:
+        conn.close()
+    return 1
 
 
 # ─── Вспомогательные функции ─────────────────
@@ -1065,5 +1146,6 @@ def get_menu(user_id: str, bot_ref=None):
         telebot.types.KeyboardButton("📊 Мой профиль"),
         telebot.types.KeyboardButton("🏆 Рейтинг"),
         telebot.types.KeyboardButton("🏆 Бит недели"),
+        telebot.types.KeyboardButton("🤝 Пригласить друга"),
     )
     return markup

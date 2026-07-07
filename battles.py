@@ -7,6 +7,7 @@ from config import (
     TICKET_FIRST, TICKET_CONTINUE, MAX_CAREER_BATTLES,
     NOTIFY_THROTTLE_HOURS,
     FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
+    REFERRAL_RATING_BONUS, REFERRAL_MAX_REWARDS,
     _settings, get_battle_hours,
 )
 from storage import (
@@ -21,6 +22,7 @@ from storage import (
     create_beat, get_beat, update_beat_status, update_beat_file,
     record_beat_battle_result, add_predicted_for, finish_beat_career,
     list_user_beats, find_active_beat_by_user,
+    add_referral_reward, mark_referral_rewarded, pop_ticket_discount,
 )
 
 _bot: telebot.TeleBot = None
@@ -59,14 +61,34 @@ def ticket_status(user_id: str) -> dict:
     return {"active": active, "progress": progress, "required": required, "paid": paid}
 
 
-def start_ticket(user_id: str, required: int):
-    """Активирует билет с нужным числом пар. Обнуляет progress."""
+def start_ticket(user_id: str, required: int) -> int:
+    """Активирует билет с нужным числом пар. Обнуляет progress.
+
+    Если у пользователя накоплена реферальная скидка — тратит одну "скидочную
+    пару" и уменьшает required (не ниже 1). Не тратит скидку, если required
+    и так уже 1 — иначе она сгорела бы без всякого эффекта (актуально для
+    TICKET_CONTINUE, который и так равен 1).
+
+    pop_ticket_discount коммитит декремент отдельной транзакцией ДО того, как
+    здесь загружается users — иначе итоговый save_users() затёр бы его
+    устаревшим снимком (та же гонка, что была с consume_ticket ранее).
+
+    Возвращает 1, если скидка была применена — вызывающий код показывает
+    об этом сообщение пользователю.
+    """
+    discount_applied = 0
+    if required > 1:
+        discount_applied = pop_ticket_discount(user_id)
+        if discount_applied:
+            required = max(1, required - discount_applied)
+
     users = load_users()
     if user_id not in users:
-        return
+        return 0
     users[user_id]["ticket_required"] = required
     users[user_id]["ticket_progress"] = 0
     save_users(users)
+    return discount_applied
 
 
 def increment_ticket(user_id: str):
@@ -305,6 +327,60 @@ def _run_beat_career_steps(b: dict, winning_side: int):
         _process_beat_career_step(beat2_id, result2, _predicted_count(predictions, "2"))
 
 
+# ─── Реферальная награда ──────────────────────
+
+def _is_users_first_battle(player_id: str, battles_data: dict, current_bid: str) -> bool:
+    """True, если у player_id нет ДРУГИХ завершённых батлов, кроме текущего.
+
+    Промпт предполагал поле users[player_id]["battles_played"], которого нет
+    в схеме пользователя (battles_played есть только у битов, за их
+    собственную карьеру — не подходит для "первый батл в жизни игрока",
+    поскольку у второго бита счётчик карьеры снова стартует с нуля). Вместо
+    нового поля просто сканируем историю батлов — на масштабе пилота дёшево.
+    """
+    for other_bid, other_b in battles_data.items():
+        if other_bid == current_bid:
+            continue
+        if other_b.get("status") == "finished" and player_id in (other_b.get("player1"), other_b.get("player2")):
+            return False
+    return True
+
+
+def _maybe_reward_referral(player_id: str, users: dict, battles_data: dict, bid: str):
+    """Начисляет награду рефереру, когда приглашённый друг реально доиграл
+    свой ПЕРВЫЙ батл до конца (неважно, победа/поражение/ничья) — это и есть
+    защита от накрутки: заманить друга зарегистрироваться дёшево, заставить
+    его пройти реальный billet→бит→батл цикл — дорого.
+    """
+    u = users.get(player_id)
+    if not u:
+        return
+    referrer_id = u.get("referred_by")
+    if not referrer_id or u.get("referral_rewarded"):
+        return
+    if not _is_users_first_battle(player_id, battles_data, bid):
+        return
+
+    if referrer_id not in users:
+        mark_referral_rewarded(player_id)
+        return
+
+    if REFERRAL_MAX_REWARDS is not None and users[referrer_id].get("referral_count", 0) >= REFERRAL_MAX_REWARDS:
+        mark_referral_rewarded(player_id)
+        return
+
+    add_referral_reward(referrer_id)
+    mark_referral_rewarded(player_id)
+    try:
+        _bot.send_message(
+            referrer_id,
+            f"🎉 Твой друг {u.get('nickname', 'кто-то')} сыграл первый батл!\n\n"
+            f"+{REFERRAL_RATING_BONUS} к рейтингу и скидка на следующий билет (-1 пара).",
+        )
+    except Exception:
+        pass
+
+
 # ─── Завершение батла ─────────────────────────
 
 def finish_battle(bid: str):
@@ -368,6 +444,8 @@ def finish_battle(bid: str):
                 except Exception:
                     pass
         _run_beat_career_steps(b, winning_side)
+        for pid in [p1, p2]:
+            _maybe_reward_referral(pid, users, battles, bid)
         return
 
     if winner_id in users:
@@ -415,6 +493,9 @@ def finish_battle(bid: str):
         pass
 
     _run_beat_career_steps(b, winning_side)
+
+    for pid in [p1, p2]:
+        _maybe_reward_referral(pid, users, battles, bid)
 
     # финалы упразднены — квалификация теперь по неделям, см. weeks.py
 
@@ -513,14 +594,16 @@ def _handle_career_continue(call):
         pass
 
     users = load_users()
+    discount_applied = 0
     if user_id in users and users[user_id].get("ticket_required", 0) == 0:
-        start_ticket(user_id, TICKET_CONTINUE)
+        discount_applied = start_ticket(user_id, TICKET_CONTINUE)
 
     status = ticket_status(user_id)
+    discount_note = "\n\n🎁 Скидка за друга применена — тебе нужно оценить на 1 пару меньше!" if discount_applied else ""
     _bot.send_message(
         call.message.chat.id,
-        f"▶️ Билет продолжения: оцени {TICKET_CONTINUE} пару, и бит вернётся в бой. "
-        f"Прогресс: {status['progress']}/{status['required']}.",
+        f"▶️ Билет продолжения: оцени {status['required']} пар{'у' if status['required'] == 1 else ''}, "
+        f"и бит вернётся в бой. Прогресс: {status['progress']}/{status['required']}.{discount_note}",
     )
 
 
@@ -1094,8 +1177,9 @@ def _send_beat(message):
 
     # Активируем билет только если он ещё не начат — не сбрасываем прогресс
     # уже начавшего платить пользователя.
+    discount_applied = 0
     if u.get("ticket_required", 0) == 0:
-        start_ticket(user_id, TICKET_FIRST)
+        discount_applied = start_ticket(user_id, TICKET_FIRST)
 
     status = ticket_status(user_id)
     if status["paid"]:
@@ -1103,11 +1187,12 @@ def _send_beat(message):
         _bot.send_message(message.chat.id, "🎵 Отправь аудиофайл с битом:")
         return
 
+    discount_note = "\n\n🎁 Скидка за друга применена — тебе нужно оценить на 1 пару меньше!" if discount_applied else ""
     _bot.send_message(
         message.chat.id,
         f"🎧 Чтобы твой бит вступил в батл, оцени {status['required']} чужих пар.\n\n"
         f"Прогресс: {status['progress']}/{status['required']}\n\n"
-        f"Нажми 🗳 Голосовать, чтобы начать.",
+        f"Нажми 🗳 Голосовать, чтобы начать.{discount_note}",
         reply_markup=get_menu(user_id),
     )
 
