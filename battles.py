@@ -107,6 +107,29 @@ def get_eligible_battles(user_id: str) -> dict:
     }
 
 
+def has_any_votable_battle(user_id: str) -> bool:
+    """True, если для этого пользователя прямо сейчас есть хотя бы один активный
+    батл, доступный для голосования (не свой, ещё не оценённый).
+
+    Bootstrap-проверка для _send_beat: та же фильтрация, что в
+    get_eligible_battles/votes_needed, но без сборки полного списка — нужен
+    только факт "есть хотя бы один", коротко замыкаем на первом совпадении.
+    Чистая проверка текущего состояния, не флаг — пересчитывается каждый раз.
+    """
+    battles_data = load_battles()
+    is_admin     = user_id == str(ADMIN_ID)
+    voted        = load_users().get(user_id, {}).get("votes_this_round", [])
+    for bid, b in battles_data.items():
+        if b.get("status") != "active":
+            continue
+        if not is_admin and user_id in (b.get("player1"), b.get("player2")):
+            continue
+        if bid in voted:
+            continue
+        return True
+    return False
+
+
 def votes_needed(user_id: str):
     eligible = get_eligible_battles(user_id)
     users    = load_users()
@@ -1055,6 +1078,20 @@ def _send_beat(message):
         )
         return
 
+    # Bootstrap: если оценивать физически нечего (нет ни одного активного
+    # батла, доступного этому пользователю), билет не запрашиваем вообще —
+    # не start_ticket/не consume_ticket, билет остаётся неактивным, как будто
+    # его никто не начинал платить. Пересчитывается при каждом входе, не флаг.
+    if not has_any_votable_battle(user_id):
+        vote_context[f"room_{user_id}"] = ROOMS[0]
+        _bot.send_message(
+            message.chat.id,
+            "🎧 Сейчас в системе ещё нет активных батлов для оценки — "
+            "твой бит станет одним из первых!\n\n"
+            "Отправь аудиофайл с битом.",
+        )
+        return
+
     # Активируем билет только если он ещё не начат — не сбрасываем прогресс
     # уже начавшего платить пользователя.
     if u.get("ticket_required", 0) == 0:
@@ -1223,7 +1260,11 @@ def _receive_beat(message):
         return
 
     status = ticket_status(user_id)
-    if not status["paid"]:
+    # Билет не оплачен и не начат (required=0) — это либо забытый шаг, либо тот
+    # самый bootstrap-случай из _send_beat: пар для оценки физически не было,
+    # поэтому билет не запрашивался вообще. Отличить эти два случая можно тем
+    # же способом, что и в _send_beat — has_any_votable_battle.
+    if not status["paid"] and not (status["required"] == 0 and not has_any_votable_battle(user_id)):
         vote_context.pop(room_key, None)
         _bot.send_message(
             message.chat.id,
