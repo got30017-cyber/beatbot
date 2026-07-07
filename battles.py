@@ -22,7 +22,6 @@ from storage import (
     record_beat_battle_result, add_predicted_for, finish_beat_career,
     list_user_beats, find_active_beat_by_user,
 )
-from finals import check_and_start_final
 
 _bot: telebot.TeleBot = None
 _scheduler = None
@@ -396,8 +395,7 @@ def finish_battle(bid: str):
 
     _run_beat_career_steps(b, winning_side)
 
-    if room:
-        check_and_start_final(room)
+    # финалы упразднены — квалификация теперь по неделям, см. weeks.py
 
 
 def _force_finish_battle(bid: str, winning_side: int):
@@ -445,9 +443,7 @@ def _force_finish_battle(bid: str, winning_side: int):
         except Exception:
             pass
 
-    room = b.get("room", "")
-    if room:
-        check_and_start_final(room)
+    # финалы упразднены — квалификация теперь по неделям, см. weeks.py
 
 
 # ─── Решение автора о карьере бита ────────────
@@ -748,7 +744,7 @@ def _send_vote_summary(chat_id, user_id: str, bid: str, vote_side: str, pred_sid
     text = (
         f"❤️ Твой выбор: Бит {vote_side} — {vote_nick}\n"
         f"🧠 Твой прогноз: Бит {pred_side} — {pred_nick}\n\n"
-        f"Угадал ли ты мнение большинства — узнаешь в конце финала. 🤫"
+        f"Угадал ли ты мнение большинства — узнаешь в конце недели. 🤫"
     )
 
     status = ticket_status(user_id)
@@ -1023,6 +1019,13 @@ def _pick_opponent(my_beat_id: str, candidates: list):
 
 def _send_beat(message):
     user_id = str(message.from_user.id)
+
+    from weeks import weekly_gate_check
+    passed, hint = weekly_gate_check(user_id)
+    if not passed:
+        _bot.send_message(message.chat.id, hint, reply_markup=get_menu(user_id))
+        return
+
     users   = load_users()
 
     if user_id not in users:
@@ -1360,6 +1363,13 @@ def _receive_beat(message):
 
 def _vote_menu(message):
     user_id = str(message.from_user.id)
+
+    from weeks import weekly_gate_check
+    passed, hint = weekly_gate_check(user_id)
+    if not passed:
+        _bot.send_message(message.chat.id, hint, reply_markup=get_menu(user_id))
+        return
+
     users   = load_users()
 
     if user_id not in users:
@@ -1396,6 +1406,13 @@ def _vote_menu(message):
 
 def _my_battle(message):
     user_id = str(message.from_user.id)
+
+    from weeks import weekly_gate_check
+    passed, hint = weekly_gate_check(user_id)
+    if not passed:
+        _bot.send_message(message.chat.id, hint, reply_markup=get_menu(user_id))
+        return
+
     users   = load_users()
 
     if user_id not in users:

@@ -168,6 +168,7 @@ def _broadcast_intuition_summaries():
     save_settings(settings)
 
 
+# УСТАРЕЛО: событие Бит недели теперь в weeks.finish_week_voting
 def finish_final(fid: str):
     finals = load_finals()
     users  = load_users()

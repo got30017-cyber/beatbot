@@ -24,9 +24,10 @@ from storage import (
     init_db, migrate_from_json,
     _category_mode_summary,
     list_user_beats,
+    get_current_week,
 )
 import battles
-import finals
+import weeks
 
 # ─── База данных ──────────────────────────────
 init_db()
@@ -38,10 +39,10 @@ scheduler = BackgroundScheduler()
 scheduler.start()
 
 battles.init(bot, scheduler)
-finals.init(bot, scheduler)
+weeks.init(bot, scheduler)
 
 battles.register_handlers(bot)
-finals.register_handlers(bot)
+weeks.register_handlers(bot)
 
 # ─── Сессии ──────────────────────────────────
 msg_pending    = {}   # user_id -> target_user_id
@@ -63,14 +64,15 @@ _ONBOARD = [
         "1. Загружаешь бит — бот находит соперника\n"
         "2. Слушатели голосуют анонимно и угадывают, что выберет большинство\n"
         "3. Победитель получает +10 к рейтингу\n\n"
-        "Накопи 3 победы → попади в финальный турнир!"
+        "Бит может сыграть до 3 батлов подряд — это его карьера. "
+        "Каждую субботу лучшие карьеры выходят на Бит недели!"
     ),
     (
         "🎧 Как получить фидбек?\n\n"
         "Чтобы твой бит вступил в батл, оцени несколько чужих пар. "
         "Это честный обмен вниманием: ты слушаешь → тебя слушают.\n\n"
         "• Побеждай в батлах → +10 к рейтингу\n"
-        "• Выиграй финал → +100 и бейдж 👑 Легенда\n\n"
+        "• Выиграй Бит недели → +100 и бейдж 👑 Легенда\n\n"
         "Готов? Создай профиль!"
     ),
 ]
@@ -221,7 +223,7 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
         f"{badge}\n",
         f"⭐️ Рейтинг: {u.get('rating', 0)}",
         f"✅ Побед: {u.get('wins', 0)}",
-        f"🏆 Финальных побед: {u.get('final_wins', 0)}",
+        f"🏆 Побед недели: {u.get('final_wins', 0)}",
     ]
     if best_wins > 0:
         lines.append(f"🎯 Лучшая комната: {ROOM_LABELS[best_room]} ({best_wins} побед)")
@@ -417,75 +419,22 @@ def cmd_help(message):
     bot.send_message(
         message.chat.id,
         "ℹ️ Как работает Beat Battle\n\n"
-        "🎵 Битмейкер шлёт трек — бот ищет соперника и стартует батл.\n"
+        "🎵 Битмейкер шлёт трек — бот ищет соперника и стартует батл. "
+        "Бит может сыграть до 3 батлов подряд — это его карьера.\n"
         "🗳 Слушатели слушают оба бита анонимно и голосуют за лучший, "
         "потом угадывают выбор большинства.\n"
-        "🏆 Лучшие биты раунда попадают в финал — финальное голосование определяет чемпиона.\n"
+        "🏆 Каждую субботу в 12:00 UTC — Бит недели: топ-5 завершённых карьер выходят "
+        "на 48-часовое голосование всего сообщества.\n"
         "🎧 Чтобы отправить свой бит в батл, сначала оцени несколько чужих пар — это входной билет.\n"
-        "⭐️ Рейтинг растёт за победы в батлах и финалах.\n\n"
-        "Команды: /start, /profile, /rating, /winners, /final, /help\n\n"
+        "⭐️ Рейтинг растёт за победы в батлах и за Бит недели.\n\n"
+        "Команды: /start, /profile, /rating, /week, /help\n\n"
         "Что-то сломалось или не так? Нажми ⚠️ под битом, чтобы пожаловаться, "
         "либо напиши организатору бота напрямую.",
     )
 
 
-# ─── Витрина ──────────────────────────────────
-
-@bot.message_handler(commands=["winners"])
-@bot.message_handler(func=lambda m: m.text == "🎯 Звёзды")
-def show_winners(message):
-    battles_data = load_battles()
-    users        = load_users()
-    user_id      = str(message.from_user.id)
-
-    finished = [(bid, b) for bid, b in battles_data.items() if b.get("status") == "finished"]
-    finished.sort(
-        key=lambda x: x[1].get("end_time") or x[1].get("start_time") or "",
-        reverse=True,
-    )
-
-    winners_cards = []
-    for bid, b in finished:
-        v1, v2 = b.get("votes1", 0), b.get("votes2", 0)
-        if v1 > v2:
-            winner_id = b["player1"]
-        elif v2 > v1:
-            winner_id = b["player2"]
-        else:
-            continue
-        winners_cards.append((bid, b, winner_id))
-        if len(winners_cards) == 5:
-            break
-
-    if not winners_cards:
-        bot.send_message(
-            message.chat.id,
-            "🏆 Пока нет завершённых батлов с победителем.",
-            reply_markup=get_menu(user_id),
-        )
-        return
-
-    bot.send_message(message.chat.id, "🌟 Последние чемпионы Beat Battle:")
-
-    for bid, b, winner_id in winners_cards:
-        wu         = users.get(winner_id, {})
-        badge      = get_badge(wu.get("wins", 0), wu.get("final_wins", 0))
-        room_label = ROOM_LABELS.get(b.get("room", ""), "").upper()
-        bio_line   = f"\n📝 {wu['bio']}" if wu.get("bio", "").strip() else ""
-
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(
-            telebot.types.InlineKeyboardButton("✉️ Написать", callback_data=f"write_{winner_id}"),
-            telebot.types.InlineKeyboardButton("👤 Профиль",  callback_data=f"profile_{winner_id}"),
-        )
-        bot.send_message(
-            message.chat.id,
-            f"🏆 ЧЕМПИОН {room_label}\n\n"
-            f"{badge} {wu.get('nickname', '—')}\n"
-            f"{wu.get('rating', 0)} очков · {wu.get('wins', 0)} побед"
-            f"{bio_line}",
-            reply_markup=markup,
-        )
+# Старая витрина "🎯 Звёзды" (show_winners) удалена — кнопка меню переиспользована
+# под "🏆 Бит недели" (см. weeks.register_handlers), сама витрина больше не нужна.
 
 
 # ─── Переписка ────────────────────────────────
@@ -607,6 +556,8 @@ def admin_panel(message):
         telebot.types.InlineKeyboardButton("👤 Тест-пользователи", callback_data="admin_test_users"),
         telebot.types.InlineKeyboardButton("⏱ Время батлов",       callback_data="admin_set_time"),
         telebot.types.InlineKeyboardButton("🏆 Порог финала",       callback_data="admin_set_threshold"),
+        telebot.types.InlineKeyboardButton("🧪 Закрыть неделю",     callback_data="admin_force_close_week"),
+        telebot.types.InlineKeyboardButton("🧪 Финиш Бита недели",  callback_data="admin_force_finish_week"),
     )
     bot.send_message(message.chat.id, "👑 Админ-панель\n\nВыбери действие:", reply_markup=markup)
 
@@ -697,6 +648,24 @@ def handle_admin_actions(call):
             f"Введи новое значение (целое число ≥ 1):",
         )
         bot.register_next_step_handler(call.message, _admin_threshold_step)
+
+    elif call.data == "admin_force_close_week":
+        bot.answer_callback_query(call.id)
+        week = get_current_week()
+        if not week or week["status"] != "running":
+            bot.send_message(call.message.chat.id, "Нет недели в статусе running для закрытия.")
+        else:
+            weeks.close_week(week["id"])
+            bot.send_message(call.message.chat.id, "✅ close_week вызван.")
+
+    elif call.data == "admin_force_finish_week":
+        bot.answer_callback_query(call.id)
+        week = get_current_week()
+        if not week or week["status"] != "voting":
+            bot.send_message(call.message.chat.id, "Нет недели в статусе voting для финиша.")
+        else:
+            weeks.finish_week_voting(week["id"])
+            bot.send_message(call.message.chat.id, "✅ finish_week_voting вызван.")
 
     elif call.data == "admin_cancel":
         bot.edit_message_text("Отменено.", call.message.chat.id, call.message.message_id)
@@ -859,8 +828,7 @@ def _admin_stop_round() -> str:
     save_users(users)
     save_queue(_empty_queue())
 
-    for room in rooms_to_check:
-        finals.check_and_start_final(room)
+    # финалы упразднены — квалификация теперь по неделям, см. weeks.py
 
     return f"✅ Раунд остановлен!\n\nБатлов завершено: {stopped}\nОчередь очищена\nГолосования сброшены"
 
@@ -941,7 +909,8 @@ def _create_test_users() -> str:
             created_users.append(f"TestBeat{i}")
     save_users(users)
 
-    created_battles = 0
+    created_battles  = 0
+    created_beat_ids = []
     for a, b_idx in [(1, 2), (3, 4), (5, 6)]:
         p1, p2 = f"test_{a}", f"test_{b_idx}"
         if _has_active_battle(p1, p2):
@@ -951,6 +920,8 @@ def _create_test_users() -> str:
         beat2_id = battles.create_beat(p2, f"TEST_FAKE_FILE_{b_idx}")
         battles.update_beat_status(beat1_id, "battling")
         battles.update_beat_status(beat2_id, "battling")
+        created_beat_ids.append(beat1_id)
+        created_beat_ids.append(beat2_id)
 
         bid        = f"battle_{len(battles_data) + 1}"
         start_time = datetime.now()
@@ -983,6 +954,16 @@ def _create_test_users() -> str:
         )
         created_battles += 1
 
+    # Доводим 4 тестовых бита до career_finished напрямую (минуя обычный флоу
+    # завершения батла) — так квалификация для Бита недели наполняется сразу,
+    # без ожидания реальных батлов. week_id проставляется автоматически в
+    # create_beat() на текущую неделю.
+    finished_test_beats = 0
+    for beat_id, result in zip(created_beat_ids[:4], ["win", "loss", "win", "draw"]):
+        battles.record_beat_battle_result(beat_id, result)
+        battles.finish_beat_career(beat_id)
+        finished_test_beats += 1
+
     lines = []
     if created_users:
         lines.append(f"✅ Тест-пользователей создано: {len(created_users)}")
@@ -992,6 +973,8 @@ def _create_test_users() -> str:
         lines.append(f"✅ Тестовых батлов создано: {created_battles}")
     else:
         lines.append("ℹ️ Тестовые батлы уже существовали.")
+    if finished_test_beats:
+        lines.append(f"✅ Тестовых карьер завершено (квалификация для Бита недели): {finished_test_beats}")
     lines.append("\nНажми 🗳 Голосовать, чтобы их увидеть.")
     return "\n".join(lines)
 
@@ -1000,7 +983,6 @@ def _create_test_users() -> str:
 
 def restore_timers():
     battles_data = load_battles()
-    finals_data  = load_finals()
     now          = datetime.now()
 
     for bid, b in battles_data.items():
@@ -1019,21 +1001,34 @@ def restore_timers():
             else:
                 battles.finish_battle(bid)
 
-    for fid, f in finals_data.items():
-        if f["status"] == "active" and "start_time" in f:
-            start    = datetime.fromisoformat(f["start_time"])
-            end_time = start + timedelta(hours=get_final_hours())
-            if end_time > now:
+    current_week = get_current_week()
+    if current_week:
+        if current_week["status"] == "running":
+            closes_at = datetime.fromisoformat(current_week["closes_at"])
+            if closes_at > now:
                 scheduler.add_job(
-                    finals.finish_final,
-                    "date",
-                    run_date=end_time,
-                    args=[fid],
-                    id=f"final_{fid}",
+                    weeks.close_week, "date",
+                    run_date=closes_at,
+                    args=[current_week["id"]],
+                    id=f"week_close_{current_week['id']}",
                     replace_existing=True,
                 )
             else:
-                finals.finish_final(fid)
+                weeks.close_week(current_week["id"])
+        elif current_week["status"] == "voting":
+            voting_ends = datetime.fromisoformat(current_week["voting_ends_at"])
+            if voting_ends > now:
+                scheduler.add_job(
+                    weeks.finish_week_voting, "date",
+                    run_date=voting_ends,
+                    args=[current_week["id"]],
+                    id=f"week_voting_{current_week['id']}",
+                    replace_existing=True,
+                )
+            else:
+                weeks.finish_week_voting(current_week["id"])
+    else:
+        weeks.ensure_current_week()
 
 
 # ─── Запуск ───────────────────────────────────

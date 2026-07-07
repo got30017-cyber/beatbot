@@ -37,6 +37,7 @@ def _ensure_user_columns(conn: sqlite3.Connection):
         "last_notified_at":    "TEXT",
         "ticket_progress":     "INTEGER DEFAULT 0",
         "ticket_required":     "INTEGER DEFAULT 0",
+        "last_weekly_vote":    "TEXT",
     }
     for col, decl in new_columns.items():
         if col not in existing:
@@ -71,6 +72,19 @@ def _ensure_queue_schema(conn: sqlite3.Connection):
         conn.execute("DROP TABLE queue")
 
 
+def _ensure_beat_columns(conn: sqlite3.Connection):
+    """Добавляет новые колонки beats в БД, созданную до их появления."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(beats)").fetchall()}
+    new_columns = {
+        "week_id":         "TEXT",
+        "qualified_for":   "TEXT",
+        "final_placement": "INTEGER",
+    }
+    for col, decl in new_columns.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE beats ADD COLUMN {col} {decl}")
+
+
 # ─── Инициализация БД ────────────────────────
 
 def init_db():
@@ -95,7 +109,8 @@ def init_db():
                     last_message_date     TEXT,
                     last_notified_at      TEXT,
                     ticket_progress       INTEGER DEFAULT 0,
-                    ticket_required       INTEGER DEFAULT 0
+                    ticket_required       INTEGER DEFAULT 0,
+                    last_weekly_vote      TEXT
                 )
             """)
             _ensure_user_columns(conn)
@@ -170,22 +185,43 @@ def init_db():
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS beats (
-                    id             TEXT PRIMARY KEY,
-                    author_id      TEXT NOT NULL,
-                    file_id        TEXT NOT NULL,
-                    title          TEXT DEFAULT '',
-                    status         TEXT NOT NULL,
-                    battles_played INTEGER DEFAULT 0,
-                    wins           INTEGER DEFAULT 0,
-                    losses         INTEGER DEFAULT 0,
-                    draws          INTEGER DEFAULT 0,
-                    predicted_for  INTEGER DEFAULT 0,
-                    created_at     TEXT NOT NULL,
-                    finished_at    TEXT
+                    id               TEXT PRIMARY KEY,
+                    author_id        TEXT NOT NULL,
+                    file_id          TEXT NOT NULL,
+                    title            TEXT DEFAULT '',
+                    status           TEXT NOT NULL,
+                    battles_played   INTEGER DEFAULT 0,
+                    wins             INTEGER DEFAULT 0,
+                    losses           INTEGER DEFAULT 0,
+                    draws            INTEGER DEFAULT 0,
+                    predicted_for    INTEGER DEFAULT 0,
+                    created_at       TEXT NOT NULL,
+                    finished_at      TEXT,
+                    week_id          TEXT,
+                    qualified_for    TEXT,
+                    final_placement  INTEGER
                 )
             """)
+            _ensure_beat_columns(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_author ON beats(author_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_status ON beats(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_week ON beats(week_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_beats_finished ON beats(status, finished_at)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS weeks (
+                    id                TEXT PRIMARY KEY,
+                    status            TEXT NOT NULL,
+                    started_at        TEXT NOT NULL,
+                    closes_at         TEXT NOT NULL,
+                    voting_ends_at    TEXT,
+                    participants      TEXT DEFAULT '[]',
+                    votes             TEXT DEFAULT '{}',
+                    predictions       TEXT DEFAULT '{}',
+                    voters            TEXT DEFAULT '[]',
+                    winner_beat_id    TEXT,
+                    finished_at       TEXT
+                )
+            """)
     finally:
         conn.close()
 
@@ -267,6 +303,7 @@ def load_users() -> dict:
             "last_notified_at":    row["last_notified_at"],
             "ticket_progress":     row["ticket_progress"] or 0,
             "ticket_required":     row["ticket_required"] or 0,
+            "last_weekly_vote":    row["last_weekly_vote"],
         }
         for row in rows
     }
@@ -282,8 +319,8 @@ def save_users(users: dict):
                    (id, nickname, role, rating, wins, final_wins,
                     battles_today, last_battle_date, is_pro, bio, votes_this_round,
                     messages_sent_today, last_message_date, last_notified_at,
-                    ticket_progress, ticket_required)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ticket_progress, ticket_required, last_weekly_vote)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (
                         uid,
@@ -302,6 +339,7 @@ def save_users(users: dict):
                         u.get("last_notified_at"),
                         u.get("ticket_progress", 0),
                         u.get("ticket_required", 0),
+                        u.get("last_weekly_vote"),
                     )
                     for uid, u in users.items()
                 ],
@@ -432,35 +470,78 @@ def save_queue(queue: dict):
 
 def _beat_row_to_dict(row) -> dict:
     return {
-        "id":             row["id"],
-        "author_id":      row["author_id"],
-        "file_id":        row["file_id"],
-        "title":          row["title"] or "",
-        "status":         row["status"],
-        "battles_played": row["battles_played"],
-        "wins":           row["wins"],
-        "losses":         row["losses"],
-        "draws":          row["draws"],
-        "predicted_for":  row["predicted_for"],
-        "created_at":     row["created_at"],
-        "finished_at":    row["finished_at"],
+        "id":              row["id"],
+        "author_id":       row["author_id"],
+        "file_id":         row["file_id"],
+        "title":           row["title"] or "",
+        "status":          row["status"],
+        "battles_played":  row["battles_played"],
+        "wins":            row["wins"],
+        "losses":          row["losses"],
+        "draws":           row["draws"],
+        "predicted_for":   row["predicted_for"],
+        "created_at":      row["created_at"],
+        "finished_at":     row["finished_at"],
+        "week_id":         row["week_id"],
+        "qualified_for":   row["qualified_for"],
+        "final_placement": row["final_placement"],
     }
 
 
 def create_beat(author_id: str, file_id: str) -> str:
+    """Проставляет week_id на текущую неделю (running/voting), если она есть.
+    Если нет — оставляет NULL, восстановится при следующем ensure_current_week()
+    (текущий пилот всегда стартует неделю при запуске бота, так что практически
+    неделя есть всегда)."""
     conn = _connect()
     try:
         with conn:
             c = conn.execute("SELECT COUNT(*) AS c FROM beats").fetchone()["c"]
             beat_id = f"beat_{c + 1}"
+            week_row = conn.execute(
+                "SELECT id FROM weeks WHERE status IN ('running', 'voting') "
+                "ORDER BY started_at DESC LIMIT 1"
+            ).fetchone()
+            week_id = week_row["id"] if week_row else None
             conn.execute(
-                """INSERT INTO beats (id, author_id, file_id, status, created_at)
-                   VALUES (?, ?, ?, 'queued', ?)""",
-                (beat_id, author_id, file_id, datetime.now().isoformat()),
+                """INSERT INTO beats (id, author_id, file_id, status, created_at, week_id)
+                   VALUES (?, ?, ?, 'queued', ?, ?)""",
+                (beat_id, author_id, file_id, datetime.now().isoformat(), week_id),
             )
     finally:
         conn.close()
     return beat_id
+
+
+def mark_beat_qualified(beat_id: str, week_id: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE beats SET qualified_for = ? WHERE id = ?", (week_id, beat_id))
+    finally:
+        conn.close()
+
+
+def set_beat_placement(beat_id: str, place: int):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE beats SET final_placement = ? WHERE id = ?", (place, beat_id))
+    finally:
+        conn.close()
+
+
+def list_finished_beats_between(start_iso: str, end_iso: str) -> list:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM beats WHERE status = 'career_finished' "
+            "AND finished_at >= ? AND finished_at <= ?",
+            (start_iso, end_iso),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_beat_row_to_dict(r) for r in rows]
 
 
 def get_beat(beat_id: str):
@@ -559,6 +640,93 @@ def find_active_beat_by_user(user_id: str):
     finally:
         conn.close()
     return _beat_row_to_dict(row) if row else None
+
+
+# ─── Недельный цикл (Бит недели) ──────────────
+# Точечные операции, НЕ load-all/save-all.
+
+def _week_row_to_dict(row) -> dict:
+    return {
+        "id":             row["id"],
+        "status":         row["status"],
+        "started_at":     row["started_at"],
+        "closes_at":      row["closes_at"],
+        "voting_ends_at": row["voting_ends_at"],
+        "participants":   json.loads(row["participants"] or "[]"),
+        "votes":          json.loads(row["votes"] or "{}"),
+        "predictions":    json.loads(row["predictions"] or "{}"),
+        "voters":         json.loads(row["voters"] or "[]"),
+        "winner_beat_id": row["winner_beat_id"],
+        "finished_at":    row["finished_at"],
+    }
+
+
+def create_week(started_at: str, closes_at: str) -> str:
+    conn = _connect()
+    try:
+        with conn:
+            c = conn.execute("SELECT COUNT(*) AS c FROM weeks").fetchone()["c"]
+            week_id = f"week_{c + 1}"
+            conn.execute(
+                "INSERT INTO weeks (id, status, started_at, closes_at) VALUES (?, 'running', ?, ?)",
+                (week_id, started_at, closes_at),
+            )
+    finally:
+        conn.close()
+    return week_id
+
+
+def get_current_week():
+    """Неделя в статусе running или voting; при нескольких — самая свежая по started_at."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM weeks WHERE status IN ('running', 'voting') "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return _week_row_to_dict(row) if row else None
+
+
+def update_week(week_id: str, **fields):
+    """Точечный апдейт нескольких полей одной транзакцией. Значения для JSON-полей
+    (participants/votes/predictions/voters) должны быть уже сериализованы вызывающим кодом."""
+    if not fields:
+        return
+    columns = ", ".join(f"{k} = ?" for k in fields)
+    values  = list(fields.values()) + [week_id]
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(f"UPDATE weeks SET {columns} WHERE id = ?", values)
+    finally:
+        conn.close()
+
+
+def finish_week_record(week_id: str, winner_beat_id: str):
+    """Названа _record, чтобы не путать с finish_week_voting в weeks.py."""
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE weeks SET status = 'finished', winner_beat_id = ?, finished_at = ? WHERE id = ?",
+                (winner_beat_id, datetime.now().isoformat(), week_id),
+            )
+    finally:
+        conn.close()
+
+
+def get_finished_weeks(limit: int = 10) -> list:
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM weeks WHERE status = 'finished' ORDER BY finished_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_week_row_to_dict(r) for r in rows]
 
 
 # ─── Finals ───────────────────────────────────
@@ -789,6 +957,7 @@ def default_user(nickname: str) -> dict:
         "last_notified_at":    None,
         "ticket_progress":     0,
         "ticket_required":     0,
+        "last_weekly_vote":    None,
     }
 
 
@@ -895,6 +1064,6 @@ def get_menu(user_id: str, bot_ref=None):
         telebot.types.KeyboardButton("🗳 Голосовать"),
         telebot.types.KeyboardButton("📊 Мой профиль"),
         telebot.types.KeyboardButton("🏆 Рейтинг"),
-        telebot.types.KeyboardButton("🎯 Звёзды"),
+        telebot.types.KeyboardButton("🏆 Бит недели"),
     )
     return markup
