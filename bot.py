@@ -55,25 +55,26 @@ _NICKNAME_RE = re.compile(r'^[\w ]+$', re.UNICODE)
 
 _ONBOARD = [
     (
-        "🎵 Добро пожаловать в Beat Battle!\n\n"
-        "Это платформа, где битмейкеры соревнуются друг с другом.\n"
-        "Загружай биты, побеждай в батлах и поднимайся на вершину рейтинга!"
+        "🎵 Добро пожаловать в Beat Battle!\n"
+        "Место, где битмейкеры слушают музыку друг друга.\n"
+        "Загружай свои биты, оценивай чужие и узнавай, как сообщество воспринимает твоё звучание."
     ),
     (
-        "⚔️ Как работают батлы?\n\n"
+        "⚔️ Как это работает?\n\n"
         "1. Загружаешь бит — бот находит соперника\n"
-        "2. Слушатели голосуют анонимно и угадывают, что выберет большинство\n"
-        "3. Победитель получает +10 к рейтингу\n\n"
-        "Бит может сыграть до 3 батлов подряд — это его карьера. "
-        "Каждую субботу лучшие карьеры выходят на Бит недели!"
+        "2. Слушатели слушают оба бита и голосуют за сильнейший, а потом угадывают, что выберет большинство\n"
+        "3. Победа даёт +10 к рейтингу\n\n"
+        "Каждый бит может сыграть до 3 батлов — это его карьера. "
+        "Сильные карьеры доходят до Бита недели — главного события каждой субботы."
     ),
     (
-        "🎧 Как получить фидбек?\n\n"
-        "Чтобы твой бит вступил в батл, оцени несколько чужих пар. "
-        "Это честный обмен вниманием: ты слушаешь → тебя слушают.\n\n"
-        "• Побеждай в батлах → +10 к рейтингу\n"
-        "• Выиграй Бит недели → +100 и бейдж 👑 Легенда\n\n"
-        "Готов? Создай профиль!"
+        "🎧 Как получить фидбек на свой бит?\n\n"
+        "Оцени несколько чужих пар — и твой бит выходит в бой. "
+        "Это честный обмен: ты слушаешь → тебя слушают.\n\n"
+        "Дальше всё просто:\n"
+        "• Побеждай в батлах → рейтинг растёт\n"
+        "• Доберись до Бита недели → шанс на титул 👑\n\n"
+        "Погнали — создай профиль!"
     ),
 ]
 
@@ -150,8 +151,9 @@ def save_nickname(message):
 
     bot.send_message(
         message.chat.id,
-        f"✅ Никнейм сохранён: {nickname}\n\n"
-        f"Теперь ты можешь отправлять биты на батлы и голосовать за чужие. Жми на кнопки внизу 👇",
+        f"✅ Готово, {nickname}!\n\n"
+        f"Ты в деле. Загружай первый бит или начни с голосования — послушай, что уже крутится в системе.\n\n"
+        f"Жми на кнопки внизу 👇",
         reply_markup=get_menu(user_id),
     )
 
@@ -205,11 +207,6 @@ def _profile_average_ratings(user_id: str, battles_data: dict):
 def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> str:
     u       = users[user_id]
     badge   = get_badge(u.get("wins", 0), u.get("final_wins", 0))
-    pro_str = "💎 Pro" if u.get("is_pro") else "Free"
-
-    room_wins = get_room_wins(user_id, battles_data)
-    best_room = max(room_wins, key=lambda r: room_wins[r])
-    best_wins = room_wins[best_room]
 
     today = datetime.now().date().isoformat()
     if u.get("last_battle_date") != today:
@@ -218,16 +215,16 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
         limit        = DAILY_LIMIT_PRO if u.get("is_pro") else DAILY_LIMIT_FREE
         battles_left = max(0, limit - u.get("battles_today", 0))
 
+    header = f"👤 {u['nickname']}"
+    if u.get("is_pro"):
+        header += " · 💎 Pro"
     lines = [
-        f"👤 {u['nickname']} ({pro_str})",
+        header,
         f"{badge}\n",
         f"⭐️ Рейтинг: {u.get('rating', 0)}",
-        f"✅ Побед: {u.get('wins', 0)}",
-        f"🏆 Побед недели: {u.get('final_wins', 0)}",
+        f"✅ Побед: {u.get('wins', 0)} · 🏆 Побед недели: {u.get('final_wins', 0)}",
+        f"⚔️ Батлов сегодня осталось: {battles_left}",
     ]
-    if best_wins > 0:
-        lines.append(f"🎯 Лучшая комната: {ROOM_LABELS[best_room]} ({best_wins} побед)")
-    lines.append(f"⚔️ Батлов сегодня осталось: {battles_left}")
 
     ticket_status = battles.ticket_status(user_id)
     if ticket_status["active"]:
@@ -248,7 +245,15 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
         for beat in user_beats:
             short_id = "#" + beat["id"].split("_")[1]
             if beat["status"] == "career_finished":
-                lines.append(f"• {short_id} — карьера завершена: {beat['wins']}W {beat['losses']}L {beat['draws']}D")
+                beat_parts = []
+                if beat["wins"]:
+                    beat_parts.append(f"{beat['wins']} побед{'а' if beat['wins'] == 1 else ('ы' if 2 <= beat['wins'] <= 4 else '')}")
+                if beat["losses"]:
+                    beat_parts.append(f"{beat['losses']} поражени{'е' if beat['losses'] == 1 else 'й'}")
+                if beat["draws"]:
+                    beat_parts.append(f"{beat['draws']} ничь{'я' if beat['draws'] == 1 else 'их'}")
+                stats_str = ", ".join(beat_parts) if beat_parts else "без побед и поражений"
+                lines.append(f"• {short_id} — {stats_str}")
             else:
                 lines.append(f"• {short_id} — {status_labels.get(beat['status'], beat['status'])}")
 
@@ -261,7 +266,7 @@ def _build_own_profile_text(user_id: str, users: dict, battles_data: dict) -> st
                 emoji = cat_label.split()[0]
                 parts.append(f"{emoji} {RATING_LABELS[label]}")
         if parts:
-            lines.append(f"📊 Средние оценки: {' · '.join(parts)}")
+            lines.append(f"📊 Как тебя оценивают: {' · '.join(parts)}")
 
     bio = u.get("bio", "").strip()
     if bio:
@@ -326,28 +331,18 @@ def handle_view_profile(call):
     target_uid = call.data.split("_", 1)[1]
     viewer_uid = str(call.from_user.id)
     users      = load_users()
-    battles_data = load_battles()
 
     u = users.get(target_uid)
     if not u:
         bot.answer_callback_query(call.id, "Пользователь не найден.")
         return
 
-    badge     = get_badge(u.get("wins", 0), u.get("final_wins", 0))
-    room_wins = get_room_wins(target_uid, battles_data)
-    top_rooms = sorted(
-        [(r, w) for r, w in room_wins.items() if w > 0],
-        key=lambda x: x[1], reverse=True,
-    )[:3]
+    badge = get_badge(u.get("wins", 0), u.get("final_wins", 0))
 
     lines = [f"👤 {u['nickname']}", badge]
     if u.get("is_pro"):
         lines.append("💎 Pro")
     lines += ["", f"⭐️ Рейтинг: {u.get('rating', 0)}", f"✅ Побед: {u.get('wins', 0)}"]
-    if top_rooms:
-        lines += ["", "🏆 Победы по жанрам:"]
-        for room, w in top_rooms:
-            lines.append(f"  {ROOM_LABELS[room]}: {w}")
     bio = u.get("bio", "").strip()
     if bio:
         lines.append(f"\n📝 {bio}")
@@ -419,17 +414,17 @@ def cmd_help(message):
     bot.send_message(
         message.chat.id,
         "ℹ️ Как работает Beat Battle\n\n"
-        "🎵 Битмейкер шлёт трек — бот ищет соперника и стартует батл. "
+        "🎵 Отправляешь бит — бот ищет соперника и стартует батл. "
         "Бит может сыграть до 3 батлов подряд — это его карьера.\n"
-        "🗳 Слушатели слушают оба бита анонимно и голосуют за лучший, "
-        "потом угадывают выбор большинства.\n"
-        "🏆 Каждую субботу в 12:00 UTC — Бит недели: топ-5 завершённых карьер выходят "
+        "🗳 Слушатели оценивают оба бита анонимно, выбирают сильнейший "
+        "и угадывают, что выберет большинство.\n"
+        "🏆 Каждую субботу — Бит недели: лучшие завершённые карьеры выходят "
         "на 48-часовое голосование всего сообщества.\n"
         "🎧 Чтобы отправить свой бит в батл, сначала оцени несколько чужих пар — это входной билет.\n"
-        "⭐️ Рейтинг растёт за победы в батлах и за Бит недели.\n\n"
+        "⭐️ Рейтинг растёт за победы в батлах и за победу в Бите недели.\n\n"
         "Команды: /start, /profile, /rating, /week, /help\n\n"
-        "Что-то сломалось или не так? Нажми ⚠️ под битом, чтобы пожаловаться, "
-        "либо напиши организатору бота напрямую.",
+        "Что-то сломалось? Нажми ⚠️ под битом, чтобы пожаловаться, "
+        "либо напиши мне напрямую.",
     )
 
 

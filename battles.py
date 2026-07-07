@@ -238,10 +238,10 @@ def _process_beat_career_step(beat_id: str, result: str, predicted_delta: int):
         try:
             _bot.send_message(
                 author_id,
-                f"🏁 Карьера твоего бита завершена — сыграны все {MAX_CAREER_BATTLES} батлов.\n\n"
-                f"✅ Побед: {beat['wins']}  ❌ Поражений: {beat['losses']}  🤝 Ничьих: {beat['draws']}\n"
-                f"🧠 За твой бит ставили в прогнозах: {beat['predicted_for']} раз\n\n"
-                f"Спасибо, что участвовал! Бит теперь ждёт конца недели.",
+                f"🏁 Карьера завершена — все {MAX_CAREER_BATTLES} батла позади.\n\n"
+                f"✅ {beat['wins']} побед · ❌ {beat['losses']} поражений · 🤝 {beat['draws']} ничьих\n"
+                f"🧠 {beat['predicted_for']} раз сообщество ставило именно на него\n\n"
+                f"Отличная работа! Теперь бит ждёт итогов недели — если он в топе, увидишь его в Бите недели.",
             )
         except Exception:
             pass
@@ -336,11 +336,11 @@ def finish_battle(bid: str):
                 try:
                     _bot.send_message(
                         pid,
-                        f"⚔️ Батл #{bid} завершён!\n\n"
-                        f"🤝 Ничья!\n"
-                        f"🎵 {p1_nick} — {votes1} гол.\n"
-                        f"🎵 {p2_nick} — {votes2} гол.\n"
-                        f"📊 Всего голосов: {total}",
+                        f"🤝 Батл завершён — ничья!\n\n"
+                        f"{p1_nick} — {votes1} голосов\n"
+                        f"{p2_nick} — {votes2} голосов\n\n"
+                        f"Бывает и так — иногда сообщество раскалывается ровно пополам. "
+                        f"Держись, следующий батл может расставить всё по местам.",
                     )
                 except Exception:
                     pass
@@ -368,12 +368,10 @@ def finish_battle(bid: str):
     try:
         _bot.send_message(
             winner_id,
-            f"🏆 Батл #{bid} завершён!\n\n"
-            f"✅ Ты победил!\n"
-            f"🎵 {winner_nick} — {winner_votes} гол. ({winner_pct}%)\n"
-            f"🎵 {loser_nick} — {loser_votes} гол. ({loser_pct}%)\n\n"
-            f"📊 Всего голосов: {total}\n"
-            f"⭐️ Твой рейтинг: {new_rating} (+10)"
+            f"🏆 Победа!\n\n"
+            f"{winner_nick} — {winner_votes} голосов ({winner_pct}%)\n"
+            f"{loser_nick} — {loser_votes} голосов ({loser_pct}%)\n\n"
+            f"Сообщество на твоей стороне. ⭐️ Рейтинг: {new_rating} (+10)"
             + (f"\n\n{winner_summary}" if winner_summary else "")
             + (f"\n\n{comments_text}" if comments_text else ""),
         )
@@ -382,11 +380,11 @@ def finish_battle(bid: str):
     try:
         _bot.send_message(
             loser_id,
-            f"⚔️ Батл #{bid} завершён!\n\n"
-            f"❌ Ты проиграл.\n"
-            f"🎵 {winner_nick} — {winner_votes} гол. ({winner_pct}%)\n"
-            f"🎵 {loser_nick} — {loser_votes} гол. ({loser_pct}%)\n\n"
-            f"📊 Всего голосов: {total}"
+            f"⚔️ Батл завершён\n\n"
+            f"{winner_nick} — {winner_votes} голосов ({winner_pct}%)\n"
+            f"{loser_nick} — {loser_votes} голосов ({loser_pct}%)\n\n"
+            f"На этот раз не зашло — но это только один батл. "
+            f"Следующий бит может звучать иначе для тех же ушей."
             + (f"\n\n{loser_summary}" if loser_summary else "")
             + (f"\n\n{comments_text}" if comments_text else ""),
         )
@@ -439,7 +437,7 @@ def _force_finish_battle(bid: str, winning_side: int):
         (loser_id,  "❌ Твой бит был удалён администратором. Батл завершён."),
     ]:
         try:
-            _bot.send_message(pid, f"⚔️ Батл #{bid} завершён досрочно.\n\n{result}")
+            _bot.send_message(pid, f"⚔️ Батл завершён досрочно.\n\n{result}")
         except Exception:
             pass
 
@@ -505,11 +503,11 @@ def _handle_career_continue(call):
 
 def _career_decision_text(beat: dict) -> str:
     return (
-        f"🎧 Карьера твоего бита:\n"
-        f"✅ Побед: {beat['wins']}  ❌ Поражений: {beat['losses']}  🤝 Ничьих: {beat['draws']}\n"
-        f"🧠 За твой бит ставили в прогнозах: {beat['predicted_for']} раз\n"
-        f"🎯 Батлов сыграно: {beat['battles_played']} из {MAX_CAREER_BATTLES}\n\n"
-        f"Что делаем дальше?"
+        f"🎧 Как дела у твоего бита:\n"
+        f"✅ {beat['wins']} побед · ❌ {beat['losses']} поражений · 🤝 {beat['draws']} ничьих\n"
+        f"🧠 {beat['predicted_for']} раз сообщество ставило именно на него в прогнозах\n"
+        f"🎯 Сыграно {beat['battles_played']} из {MAX_CAREER_BATTLES} батлов\n\n"
+        f"Продолжаем его историю?"
     )
 
 
@@ -537,7 +535,7 @@ def _handle_career_finish(call):
         telebot.types.InlineKeyboardButton("✅ Да, завершить", callback_data=f"career_finish_confirm_{beat_id}"),
         telebot.types.InlineKeyboardButton("🔙 Назад", callback_data=f"career_finish_cancel_{beat_id}"),
     )
-    text = "🏁 Завершить карьеру этого бита?\n\nЭто необратимо — продолжить потом не получится."
+    text = "🏁 Завершить карьеру этого бита?\n\nЭто решение необратимое — продолжить будет нельзя."
     try:
         _bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
     except Exception:
@@ -559,7 +557,7 @@ def _handle_career_finish_confirm(call):
         _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
     except Exception:
         pass
-    _bot.send_message(call.message.chat.id, "🏁 Карьера бита завершена. Спасибо, что играл! Бит ждёт конца недели.")
+    _bot.send_message(call.message.chat.id, "🏁 Карьера завершена. Спасибо, что играл! Если бит в топе недели — увидишь его в Бите недели.")
 
 
 def _handle_career_finish_cancel(call):
@@ -583,24 +581,20 @@ def _handle_career_finish_cancel(call):
 # ─── Показ батла для голосования ─────────────
 
 def send_battle_for_vote(chat_id, bid, battles):
-    b          = battles[bid]
-    room_label = ROOM_LABELS.get(b.get("room", ""), "")
+    b = battles[bid]
 
     order = [1, 2]
     random.shuffle(order)   # порядок прослушивания рандомный для каждого голосующего
     _first_side_shown[str(chat_id)] = str(order[0])
 
-    for position, side in enumerate(order):
+    for side in order:
         file_id = b.get(f"beat{side}_file_id")
         report_markup = telebot.types.InlineKeyboardMarkup()
         report_markup.add(telebot.types.InlineKeyboardButton(
             f"⚠️ Пожаловаться на бит {side}", callback_data=f"report_{bid}_{side}",
         ))
 
-        if position == 0:
-            caption = f"🎵 Бит {side}"
-        else:
-            caption = f"🎵 Бит {side}\n\n⚔️ Батл #{bid} {room_label}"
+        caption = f"🎵 Бит {side}"
 
         if file_id:
             try:
@@ -676,7 +670,7 @@ def _handle_vote(call):
         telebot.types.InlineKeyboardButton(f"🎵 Бит {s}", callback_data=f"pred_{bid}_{s}")
         for s in pred_sides
     ])
-    _bot.send_message(call.message.chat.id, "🧠 А какой бит, по-твоему, выберет большинство?", reply_markup=pred_markup)
+    _bot.send_message(call.message.chat.id, "🧠 Как думаешь, что выберет большинство?", reply_markup=pred_markup)
 
 
 def _handle_prediction(call):
@@ -736,23 +730,18 @@ def _handle_prediction(call):
 
 
 def _send_vote_summary(chat_id, user_id: str, bid: str, vote_side: str, pred_side: str, users: dict, b: dict):
-    p1_nick   = users.get(b["player1"], {}).get("nickname", "Игрок 1")
-    p2_nick   = users.get(b["player2"], {}).get("nickname", "Игрок 2")
-    vote_nick = p1_nick if vote_side == "1" else p2_nick
-    pred_nick = p1_nick if pred_side == "1" else p2_nick
-
     text = (
-        f"❤️ Твой выбор: Бит {vote_side} — {vote_nick}\n"
-        f"🧠 Твой прогноз: Бит {pred_side} — {pred_nick}\n\n"
-        f"Угадал ли ты мнение большинства — узнаешь в конце недели. 🤫"
+        f"❤️ Твой выбор: Бит {vote_side}\n"
+        f"🧠 Твой прогноз: Бит {pred_side}\n\n"
+        f"Угадал ли ты сообщество — узнаешь в конце недели. 🤫"
     )
 
     status = ticket_status(user_id)
     if status["active"]:
         if status["paid"]:
-            text += "\n\n✅ Билет оплачен! Теперь можешь загрузить бит — нажми 🎵 Отправить бит."
+            text += "\n\n✅ Билет оплачен — теперь можешь загрузить бит! Жми 🎵 Отправить бит."
         else:
-            text += f"\n\n🎧 Прогресс билета: {status['progress']}/{status['required']}"
+            text += f"\n\n🎧 Билет: {status['progress']}/{status['required']}"
 
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.row(
@@ -1330,20 +1319,21 @@ def _receive_beat(message):
 
         p1_nick    = users.get(opponent_id, {}).get("nickname", "Соперник")
         p2_nick    = users.get(user_id, {}).get("nickname", "Ты")
-        room_label = ROOM_LABELS[room]
 
         try:
             _bot.send_message(
                 opponent_id,
-                f"⚔️ Батл начался! {room_label}\nСоперник: {p2_nick}\nБатл ID: {bid}\n\n"
-                f"Голосование открыто {get_battle_hours()} часов.",
+                f"⚔️ Батл начался!\n\n"
+                f"Твой соперник — {p2_nick}. Слушатели уже решают, кто сильнее.\n\n"
+                f"Голосование идёт {get_battle_hours()} часов — узнаешь результат, как только оно закроется.",
             )
         except Exception:
             pass
         _bot.send_message(
             message.chat.id,
-            f"⚔️ Батл начался! {room_label}\nСоперник: {p1_nick}\nБатл ID: {bid}\n\n"
-            f"Голосование открыто {get_battle_hours()} часов.",
+            f"⚔️ Батл начался!\n\n"
+            f"Твой соперник — {p1_nick}. Слушатели уже решают, кто сильнее.\n\n"
+            f"Голосование идёт {get_battle_hours()} часов — узнаешь результат, как только оно закроется.",
             reply_markup=get_menu(user_id),
         )
 
@@ -1356,7 +1346,7 @@ def _receive_beat(message):
         consume_ticket(user_id)
         _bot.send_message(
             message.chat.id,
-            f"✅ Бит принят! {ROOM_LABELS[room]}\nЖдём соперника... ⏳",
+            f"✅ Бит принят!\n\nЖдём соперника — как только кто-то отправит свой, батл начнётся автоматически. ⏳",
             reply_markup=get_menu(user_id),
         )
 
@@ -1382,8 +1372,8 @@ def _vote_menu(message):
     if not not_voted:
         _bot.send_message(
             message.chat.id,
-            "✅ Ты уже проголосовал во всех активных батлах!\n\n"
-            "Как только появятся новые — снова можешь голосовать и зарабатывать монеты.",
+            "✅ Ты уже оценил все активные батлы!\n\n"
+            "Загляни чуть позже — как только появятся новые пары, сможешь снова голосовать.",
             reply_markup=get_menu(user_id),
         )
         return
@@ -1396,10 +1386,12 @@ def _vote_menu(message):
         else:
             ticket_line = f"🎧 Билет: {status['progress']}/{status['required']} пар оценено.\n\n"
 
+    pairs_count = len(not_voted)
+    pairs_word  = "пара" if pairs_count == 1 else ("пары" if 2 <= pairs_count <= 4 else "пар")
     _bot.send_message(
         message.chat.id,
-        f"{ticket_line}🗳 Батлов для голосования: {len(not_voted)}\n\n"
-        f"Слушай оба бита, реши какой сильнее — а потом угадай, что выберет большинство. 🎧",
+        f"{ticket_line}Впереди {pairs_count} {pairs_word}. "
+        f"Слушай оба бита в каждой, выбирай сильнейший — а потом угадай, что выберет большинство.",
     )
     send_next_battle_for_vote(message.chat.id, user_id, not_voted)
 
@@ -1424,7 +1416,7 @@ def _my_battle(message):
         _bot.send_message(message.chat.id, "⏳ Твой бит в очереди — ждём соперника.", reply_markup=get_menu(user_id))
         return
 
-    bid, b = find_user_battle(user_id)
+    _, b = find_user_battle(user_id)
     if not b:
         _bot.send_message(
             message.chat.id,
@@ -1448,11 +1440,10 @@ def _my_battle(message):
     opp_pct = 100 - my_pct
 
     status_label = "✅ Завершён" if b["status"] == "finished" else "⏳ Идёт"
-    room_label   = ROOM_LABELS.get(b.get("room", ""), "")
 
     _bot.send_message(
         message.chat.id,
-        f"⚔️ Батл #{bid} {room_label} — {status_label}\n\n"
+        f"⚔️ Твой батл — {status_label}\n\n"
         f"🎵 {my_nick} (ты) — {my_v} голосов ({my_pct}%)\n"
         f"🎵 {opp_nick} — {opp_v} голосов ({opp_pct}%)\n\n"
         f"📊 Всего голосов: {total}",

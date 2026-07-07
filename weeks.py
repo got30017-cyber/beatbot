@@ -108,9 +108,9 @@ def close_week(week_id: str):
             try:
                 _bot.send_message(
                     uid,
-                    f"⏳ На этой неделе завершено меньше {WEEK_MIN_QUALIFIED} карьер.\n"
-                    f"Неделя продлевается — Бит недели пройдёт в следующую субботу.\n"
-                    f"Загружайте биты и играйте карьеры!",
+                    f"⏳ На этой неделе пока мало завершённых карьер для полноценного отбора.\n\n"
+                    f"Бит недели пройдёт в следующую субботу — у тебя есть ещё немного времени, "
+                    f"чтобы твой бит попал в число лучших. Загружай и играй!",
                 )
             except Exception:
                 pass
@@ -149,10 +149,10 @@ def close_week(week_id: str):
         try:
             _bot.send_message(
                 uid,
-                f"🎧 Бит недели — голосование началось!\n\n"
-                f"{len(participants)} лучших битов недели ждут твоего слуха.\n"
-                f"У тебя есть {WEEK_VOTING_HOURS} часов, чтобы послушать всех и выбрать своего фаворита.\n\n"
-                f"Нажми /week чтобы начать.",
+                f"🎧 Бит недели начался!\n\n"
+                f"{len(participants)} лучших битов этой недели ждут твоего вердикта. "
+                f"У тебя {WEEK_VOTING_HOURS} часов, чтобы послушать всех и выбрать фаворита.\n\n"
+                f"Заходи → /week",
             )
         except Exception:
             pass
@@ -172,7 +172,7 @@ def _cmd_week(message):
         _bot.send_message(
             message.chat.id,
             "Сейчас нет активного Бита недели.\n\n"
-            "Ближайшее закрытие недели: суббота 12:00 UTC.",
+            "Ближайшее закрытие недели — в субботу. Загружай биты и играй карьеры, чтобы попасть в число лучших!",
             reply_markup=get_menu(user_id),
         )
         return
@@ -329,9 +329,9 @@ def _handle_week_prediction(call):
 
     _bot.send_message(
         call.message.chat.id,
-        f"❤️ Твой выбор: Бит {vote_pos}.\n"
-        f"🧠 Твой прогноз: Бит {pred_pos}.\n\n"
-        f"Итоги — через {hours_left} часов 🤫",
+        f"❤️ Твой выбор: Бит {vote_pos}\n"
+        f"🧠 Твой прогноз: Бит {pred_pos}\n\n"
+        f"Итоги — примерно через {hours_left} ч. 🤫",
         reply_markup=get_menu(user_id),
     )
 
@@ -389,12 +389,17 @@ def finish_week_voting(week_id: str):
                 users[author_id]["rating"] = users[author_id].get("rating", 0) + 25
 
         medal = medals[i - 1] if i <= 3 else f"{i}."
-        top_lines.append(f"{medal} {nick} — {v} голосов")
+        top_lines.append(f"{medal} {nick} — {v}")
 
     save_users(users)
     finish_week_record(week_id, winner_beat_id)
 
-    msg = f"🏆 Бит недели: {winner_nick}!\n\nТоп:\n" + "\n".join(top_lines)
+    msg = (
+        f"🏆 Бит недели — {winner_nick}!\n\n"
+        f"Сообщество выбрало. Вот как распределились голоса:\n\n"
+        + "\n".join(top_lines)
+        + f"\n\nПоздравляем {winner_nick} с титулом 👑 Легенда недели!"
+    )
     for uid in load_users():
         try:
             _bot.send_message(uid, msg)
