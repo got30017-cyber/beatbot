@@ -1259,20 +1259,23 @@ def _receive_beat(message):
         )
         return
 
-    status = ticket_status(user_id)
-    # Билет не оплачен и не начат (required=0) — это либо забытый шаг, либо тот
-    # самый bootstrap-случай из _send_beat: пар для оценки физически не было,
-    # поэтому билет не запрашивался вообще. Отличить эти два случая можно тем
-    # же способом, что и в _send_beat — has_any_votable_battle.
-    if not status["paid"] and not (status["required"] == 0 and not has_any_votable_battle(user_id)):
-        vote_context.pop(room_key, None)
-        _bot.send_message(
-            message.chat.id,
-            f"⚠️ Сначала оплати билет: оцени {status['required']} пар.\n"
-            f"Прогресс: {status['progress']}/{status['required']}.",
-            reply_markup=get_menu(user_id),
-        )
-        return
+    if not has_any_votable_battle(user_id):
+        # Бутстрап: система пуста, оценивать нечего — билет не требуется для
+        # этого входа, независимо от того, начинал ли пользователь его когда-то
+        # платить. Ничего не "потребляем" — просто идём дальше по обычному
+        # флоу приёма бита, как если бы билет был не нужен вовсе.
+        pass
+    else:
+        status = ticket_status(user_id)
+        if not status["paid"]:
+            vote_context.pop(room_key, None)
+            _bot.send_message(
+                message.chat.id,
+                f"⚠️ Сначала оплати билет: оцени {status['required']} пар.\n"
+                f"Прогресс: {status['progress']}/{status['required']}.",
+                reply_markup=get_menu(user_id),
+            )
+            return
 
     u = users[user_id]
     exhausted, _ = check_daily_limit(u)
