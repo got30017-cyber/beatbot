@@ -1598,12 +1598,29 @@ def _my_battle(message):
 
     status_label = "✅ Завершён" if b["status"] == "finished" else "⏳ Идёт"
 
+    time_line = ""
+    if b.get("status") == "active":
+        start_time = datetime.fromisoformat(b["start_time"])
+        end_time   = start_time + timedelta(hours=get_battle_hours())
+        remaining  = end_time - datetime.now()
+        if remaining.total_seconds() > 0:
+            hours_left   = int(remaining.total_seconds() // 3600)
+            minutes_left = int((remaining.total_seconds() % 3600) // 60)
+            if hours_left > 0:
+                time_str = f"{hours_left} ч {minutes_left} мин"
+            else:
+                time_str = f"{minutes_left} мин"
+            time_line = f"\n⏳ До завершения: {time_str}"
+        else:
+            time_line = "\n⏳ Батл вот-вот завершится"
+
     _bot.send_message(
         message.chat.id,
         f"⚔️ Твой батл — {status_label}\n\n"
         f"🎵 {my_nick} (ты) — {my_v} голосов ({my_pct}%)\n"
         f"🎵 {opp_nick} — {opp_v} голосов ({opp_pct}%)\n\n"
-        f"📊 Всего голосов: {total}",
+        f"📊 Всего голосов: {total}"
+        f"{time_line}",
         reply_markup=get_menu(user_id),
     )
 

@@ -27,6 +27,14 @@ def init(bot: telebot.TeleBot, scheduler):
     _scheduler = scheduler
 
 
+def _pluralize_days(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return "дня"
+    return "дней"
+
+
 # ─── Планирование и создание недели ──────────
 
 def _next_week_close_datetime(now: datetime) -> datetime:
@@ -168,11 +176,38 @@ def _cmd_week(message):
         return
 
     week = get_current_week()
-    if not week or week["status"] != "voting":
+    if not week:
         _bot.send_message(
             message.chat.id,
-            "Сейчас нет активного Бита недели.\n\n"
-            "Ближайшее закрытие недели — в субботу. Загружай биты и играй карьеры, чтобы попасть в число лучших!",
+            "Сейчас нет активного цикла — но это временно, новый скоро запустится. Попробуй чуть позже.",
+            reply_markup=get_menu(user_id),
+        )
+        return
+
+    if week["status"] == "running":
+        closes_at  = datetime.fromisoformat(week["closes_at"])
+        remaining  = closes_at - datetime.now()
+        days_left  = remaining.days
+        hours_left = remaining.seconds // 3600
+        if days_left > 0:
+            time_str = f"{days_left} {_pluralize_days(days_left)}"
+            if hours_left > 0:
+                time_str += f" {hours_left} ч"
+        else:
+            time_str = f"{hours_left} ч"
+        _bot.send_message(
+            message.chat.id,
+            f"🎯 Сейчас идёт набор карьер этой недели.\n\n"
+            f"До закрытия недели и старта голосования Бита недели: {time_str}.\n\n"
+            f"Загружай биты и играй карьеры, чтобы попасть в число лучших!",
+            reply_markup=get_menu(user_id),
+        )
+        return
+
+    if week["status"] != "voting":
+        _bot.send_message(
+            message.chat.id,
+            "Сейчас нет активного голосования Бита недели. Загляни чуть позже.",
             reply_markup=get_menu(user_id),
         )
         return
