@@ -18,7 +18,6 @@ from storage import (
     load_users, save_users,
     load_battles, save_battles,
     load_finals,
-    load_queue, save_queue, _empty_queue,
     default_user, get_badge, get_room_wins,
     get_menu,
     load_settings, save_settings,
@@ -27,6 +26,7 @@ from storage import (
     list_user_beats,
     get_current_week,
     set_referred_by,
+    get_open_registration_slot, get_running_slot,
 )
 import battles
 import weeks
@@ -594,13 +594,14 @@ def admin_panel(message):
 
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.add(
-        telebot.types.InlineKeyboardButton("🛑 Остановить раунд",  callback_data="admin_stop_round"),
-        telebot.types.InlineKeyboardButton("🏆 Остановить финал",  callback_data="admin_stop_final"),
-        telebot.types.InlineKeyboardButton("👤 Тест-пользователи", callback_data="admin_test_users"),
-        telebot.types.InlineKeyboardButton("⏱ Время батлов",       callback_data="admin_set_time"),
-        telebot.types.InlineKeyboardButton("🏆 Порог финала",       callback_data="admin_set_threshold"),
-        telebot.types.InlineKeyboardButton("🧪 Закрыть неделю",     callback_data="admin_force_close_week"),
-        telebot.types.InlineKeyboardButton("🧪 Финиш Бита недели",  callback_data="admin_force_finish_week"),
+        telebot.types.InlineKeyboardButton("▶️ Запустить слот",         callback_data="admin_start_slot"),
+        telebot.types.InlineKeyboardButton("🛑 Завершить слот сейчас",  callback_data="admin_finish_slot"),
+        telebot.types.InlineKeyboardButton("🏆 Остановить финал",       callback_data="admin_stop_final"),
+        telebot.types.InlineKeyboardButton("👤 Тест-пользователи",      callback_data="admin_test_users"),
+        telebot.types.InlineKeyboardButton("⏱ Время батлов",            callback_data="admin_set_time"),
+        telebot.types.InlineKeyboardButton("🏆 Порог финала",           callback_data="admin_set_threshold"),
+        telebot.types.InlineKeyboardButton("🧪 Закрыть неделю",         callback_data="admin_force_close_week"),
+        telebot.types.InlineKeyboardButton("🧪 Финиш Бита недели",      callback_data="admin_force_finish_week"),
     )
     bot.send_message(message.chat.id, "👑 Админ-панель\n\nВыбери действие:", reply_markup=markup)
 
@@ -611,20 +612,54 @@ def handle_admin_actions(call):
         bot.answer_callback_query(call.id, "⛔️ Нет доступа.")
         return
 
-    if call.data == "admin_stop_round":
+    if call.data == "admin_start_slot":
+        bot.answer_callback_query(call.id)
+        slot = get_open_registration_slot()
+        if not slot:
+            bot.send_message(
+                call.message.chat.id,
+                "Нет открытого набора. Слот создаётся автоматически, когда первый бит попадает в набор.",
+            )
+            return
+        ok, result = battles.start_slot(slot["id"])
+        if ok:
+            bot.send_message(call.message.chat.id, f"✅ Слот запущен. Создано батлов: {len(result)}")
+        else:
+            bot.send_message(
+                call.message.chat.id,
+                f"⚠️ Недостаточно битов для старта (нужно ≥ 2). "
+                f"Сейчас в наборе: {len(slot['registered_beats'])}.",
+            )
+
+    elif call.data == "admin_finish_slot":
+        bot.answer_callback_query(call.id)
+        slot = get_running_slot()
+        if not slot:
+            bot.send_message(call.message.chat.id, "Нет активного слота для завершения.")
+            return
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(
-            telebot.types.InlineKeyboardButton("✅ Да, остановить", callback_data="admin_confirm_stop"),
-            telebot.types.InlineKeyboardButton("❌ Отмена",         callback_data="admin_cancel"),
+            telebot.types.InlineKeyboardButton("✅ Да, завершить", callback_data="admin_confirm_finish_slot"),
+            telebot.types.InlineKeyboardButton("❌ Отмена",        callback_data="admin_cancel"),
         )
         bot.edit_message_text(
-            "⚠️ Остановить все активные батлы и очистить очередь?\n\nПодтверждаешь?",
+            "⚠️ Завершить активный слот досрочно?\n\nПодтверждаешь?",
             call.message.chat.id, call.message.message_id, reply_markup=markup,
         )
 
-    elif call.data == "admin_confirm_stop":
-        bot.edit_message_text("⏳ Останавливаю раунд...", call.message.chat.id, call.message.message_id)
-        bot.send_message(call.message.chat.id, _admin_stop_round())
+    elif call.data == "admin_confirm_finish_slot":
+        slot = get_running_slot()
+        if not slot:
+            bot.edit_message_text("Нет активного слота для завершения.", call.message.chat.id, call.message.message_id)
+            return
+        bot.edit_message_text("⏳ Завершаю слот...", call.message.chat.id, call.message.message_id)
+        # id таймера — тот же, что вешает battles.start_slot (см. S3).
+        try:
+            scheduler.remove_job(f"slot_{slot['id']}")
+        except Exception:
+            pass
+        battles.finish_slot(slot["id"])
+        bot.send_message(call.message.chat.id, "🛑 Слот завершён досрочно.")
 
     elif call.data == "admin_stop_final":
         finals_data = load_finals()
@@ -778,103 +813,10 @@ def _admin_threshold_step(message):
     bot.send_message(message.chat.id, f"✅ Порог финала обновлён: {val} побед.")
 
 
-# ─── Функции остановки раунда/финала ─────────
-
-def _admin_stop_round() -> str:
-    battles_data   = load_battles()
-    users          = load_users()
-    queue          = load_queue()
-    active         = {bid: b for bid, b in battles_data.items() if b["status"] == "active"}
-    stopped        = 0
-    rooms_to_check = set()
-
-    for bid, b in active.items():
-        votes1, votes2 = b.get("votes1", 0), b.get("votes2", 0)
-        p1, p2         = b["player1"], b["player2"]
-        p1_nick        = users.get(p1, {}).get("nickname", "Игрок 1")
-        p2_nick        = users.get(p2, {}).get("nickname", "Игрок 2")
-        room           = b.get("room", "")
-
-        b["status"]   = "finished"
-        b["end_time"] = datetime.now().isoformat()
-
-        if votes1 > votes2:
-            winner_id, winning_side = p1, 1
-        elif votes2 > votes1:
-            winner_id, winning_side = p2, 2
-        else:
-            winner_id, winning_side = None, 0
-
-        if winner_id and winner_id in users:
-            users[winner_id]["rating"] = users[winner_id].get("rating", 0) + 10
-            users[winner_id]["wins"]   = users[winner_id].get("wins", 0) + 1
-            b["counted_for_final"]     = True
-            if room:
-                rooms_to_check.add(room)
-
-        for uid_str, voted_side in b.get("votes", {}).items():
-            if uid_str not in users:
-                continue
-            if winning_side and voted_side == str(winning_side):
-                users[uid_str]["rating"] = users[uid_str].get("rating", 0) + 1
-
-        try:
-            scheduler.remove_job(bid)
-        except Exception:
-            pass
-
-        summary1 = battles._feedback_summary_text(b, "1")
-        summary2 = battles._feedback_summary_text(b, "2")
-
-        for pid, nick, votes, opp_nick, opp_votes, summary in [
-            (p1, p1_nick, votes1, p2_nick, votes2, summary1),
-            (p2, p2_nick, votes2, p1_nick, votes1, summary2),
-        ]:
-            try:
-                if winner_id is None:
-                    result_text = "🤝 Ничья!"
-                elif pid == winner_id:
-                    result_text = "✅ Ты победил! +10 очков"
-                else:
-                    result_text = "❌ Ты проиграл."
-                bot.send_message(
-                    pid,
-                    f"🛑 Батл #{bid} остановлен администратором.\n\n"
-                    f"{nick} — {votes} голосов\n{opp_nick} — {opp_votes} голосов\n\n{result_text}"
-                    + (f"\n\n{summary}" if summary else ""),
-                )
-            except Exception:
-                pass
-
-        stopped += 1
-
-    for room in ROOMS:
-        for uid in list(queue[room].keys()):
-            try:
-                bot.send_message(uid, "🛑 Раунд остановлен. Твой бит удалён из очереди.")
-            except Exception:
-                pass
-
-    for uid in users:
-        users[uid]["votes_this_round"] = []
-
-    # Очищаем сессионные данные в battles
-    battles.vote_session.clear()
-    battles.vote_context.clear()
-    battles.pending_feedback.clear()
-    battles._first_side_shown.clear()
-    battles.pending_prediction.clear()
-    battles.pair_shown_at.clear()
-    battles.voted_at.clear()
-
-    save_battles(battles_data)
-    save_users(users)
-    save_queue(_empty_queue())
-
-    # финалы упразднены — квалификация теперь по неделям, см. weeks.py
-
-    return f"✅ Раунд остановлен!\n\nБатлов завершено: {stopped}\nОчередь очищена\nГолосования сброшены"
-
+# ─── Функции остановки финала ────────────────
+# _admin_stop_round() (старая очередь/индивидуальные батлы) упразднена вместе
+# с очередью — её роль в слотовой модели играет admin_finish_slot ->
+# battles.finish_slot() (S4).
 
 def _admin_stop_final(fid: str) -> str:
     from storage import load_finals, save_finals
@@ -1028,6 +970,12 @@ def restore_timers():
     battles_data = load_battles()
     now          = datetime.now()
 
+    # Легаси: в слотовой модели активные батлы завершаются пачкой через
+    # finish_slot (единый таймер на слот, восстанавливается ниже), а не
+    # индивидуально. Этот цикл остаётся только на случай "осиротевших"
+    # батлов старой (досслотовой) модели, у которых нет своего слота —
+    # на чистой БД пилота таких не будет, но на БД разработки они могут
+    # ещё висеть. Не убирать — иначе такие батлы никогда не завершатся.
     for bid, b in battles_data.items():
         if b["status"] == "active" and "start_time" in b:
             start    = datetime.fromisoformat(b["start_time"])
@@ -1072,6 +1020,20 @@ def restore_timers():
                 weeks.finish_week_voting(current_week["id"])
     else:
         weeks.ensure_current_week()
+
+    running_slot = get_running_slot()
+    if running_slot and running_slot.get("voting_ends_at"):
+        voting_ends = datetime.fromisoformat(running_slot["voting_ends_at"])
+        if voting_ends > now:
+            scheduler.add_job(
+                battles.finish_slot, "date",
+                run_date=voting_ends,
+                args=[running_slot["id"]],
+                id=f"slot_{running_slot['id']}",
+                replace_existing=True,
+            )
+        else:
+            battles.finish_slot(running_slot["id"])
 
 
 # ─── Запуск ───────────────────────────────────
