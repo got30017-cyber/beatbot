@@ -13,9 +13,8 @@ from config import (
 from storage import (
     load_users, save_users,
     load_battles, save_battles,
-    load_queue, save_queue,
     _empty_queue,
-    check_daily_limit, user_in_queue, get_menu,
+    check_daily_limit, get_menu,
     _category_mode_summary,
     add_pair_rating, resolve_pair_ratings,
     get_user_intuition_stats, get_all_intuition_accuracy,
@@ -23,6 +22,8 @@ from storage import (
     record_beat_battle_result, add_predicted_for, finish_beat_career,
     list_user_beats, find_active_beat_by_user,
     add_referral_reward, mark_referral_rewarded, pop_ticket_discount,
+    ensure_registration_slot, get_registration_beats, beat_in_registration,
+    user_in_registration, remove_beat_from_registration, register_beat_to_slot,
 )
 
 _bot: telebot.TeleBot = None
@@ -579,11 +580,7 @@ def _force_finish_battle(bid: str, winning_side: int):
 
 def _maybe_resume_career(user_id: str, chat_id):
     """После оплаты билета продолжения — если у автора есть бит в
-    awaiting_decision, автоматически возвращает его в очередь.
-
-    Бит не хранит свою комнату (в схеме нет такого поля) — на пилоте
-    комната всего одна (ROOMS[0]), поэтому используем её напрямую.
-    """
+    awaiting_decision, автоматически возвращает его в набор слота."""
     status = ticket_status(user_id)
     if not status["paid"]:
         return
@@ -592,15 +589,13 @@ def _maybe_resume_career(user_id: str, chat_id):
     if not beat or beat["status"] != "awaiting_decision":
         return
 
-    room  = ROOMS[0]
-    queue = load_queue()
-    queue[room][user_id] = beat["file_id"]
+    slot_id = ensure_registration_slot()
+    register_beat_to_slot(slot_id, beat["id"])
     update_beat_status(beat["id"], "queued")
-    save_queue(queue)
     consume_ticket(user_id)
 
     try:
-        _bot.send_message(chat_id, "✅ Билет оплачен — твой бит снова в очереди.")
+        _bot.send_message(chat_id, "✅ Билет оплачен — твой бит снова в наборе на слот.")
     except Exception:
         pass
 
@@ -1157,16 +1152,15 @@ def _send_beat(message):
 
     u = users[user_id]
 
-    # Проверка "уже в очереди" идёт раньше остальных гейтов — иначе юзер не
+    # Проверка "уже в наборе" идёт раньше остальных гейтов — иначе юзер не
     # сможет добраться до кнопки отмены, упираясь в лимит/билет.
-    queue = load_queue()
-    if user_in_queue(user_id, queue):
+    if user_in_registration(user_id):
         markup = telebot.types.InlineKeyboardMarkup()
         markup.add(
             telebot.types.InlineKeyboardButton("❌ Отменить бит", callback_data="cancel_beat"),
             telebot.types.InlineKeyboardButton("🔙 Назад",        callback_data="cancel_ignore"),
         )
-        _bot.send_message(message.chat.id, "⏳ Твой бит уже в очереди.\n\nХочешь отменить?", reply_markup=markup)
+        _bot.send_message(message.chat.id, "⏳ Твой бит уже в наборе.\n\nХочешь отменить?", reply_markup=markup)
         return
 
     exhausted, _ = check_daily_limit(u)
@@ -1226,7 +1220,7 @@ def _send_beat(message):
 
 
 def _edit_beat(message):
-    """Замена аудиофайла уже стоящего в очереди бита — билет уже оплачен за
+    """Замена аудиофайла уже стоящего в наборе бита — билет уже оплачен за
     участие бита, а не за конкретный файл, поэтому замена бесплатна."""
     user_id = str(message.from_user.id)
     users   = load_users()
@@ -1235,13 +1229,15 @@ def _edit_beat(message):
         _bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
         return
 
-    queue = load_queue()
-    room  = user_in_queue(user_id, queue)
-    if not room:
-        _bot.send_message(message.chat.id, "Бит уже не в очереди — редактировать нечего.", reply_markup=get_menu(user_id))
+    slot_id = user_in_registration(user_id)
+    if not slot_id:
+        _bot.send_message(message.chat.id, "Бит уже не в наборе — редактировать нечего.", reply_markup=get_menu(user_id))
         return
 
-    vote_context[f"editing_{user_id}"] = room
+    # Комната больше не значима для набора слота (слот — плоский список
+    # битов, мультикомнатность отложена) — флаг только маркирует режим
+    # редактирования для _receive_beat, значение неважно, раз комната одна.
+    vote_context[f"editing_{user_id}"] = ROOMS[0]
     markup = telebot.types.InlineKeyboardMarkup()
     markup.add(telebot.types.InlineKeyboardButton("❌ Отменить бит вместо замены", callback_data="cancel_beat"))
     _bot.send_message(
@@ -1299,26 +1295,59 @@ def _handle_room_select(call):
 
 
 def _handle_cancel_beat(call):
+    """Отмена — это пауза, не завершение карьеры: прогресс (battles_played)
+    сохраняется, бит можно позже вернуть в набор кнопкой «Мой батл»
+    (см. _handle_resume_paused)."""
     user_id = str(call.from_user.id)
     _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
 
     if call.data == "cancel_ignore":
         _bot.answer_callback_query(call.id)
-        _bot.send_message(call.message.chat.id, "Хорошо, бит остаётся в очереди.", reply_markup=get_menu(user_id))
+        _bot.send_message(call.message.chat.id, "Хорошо, бит остаётся в наборе.", reply_markup=get_menu(user_id))
         return
 
     vote_context.pop(f"editing_{user_id}", None)
 
-    queue = load_queue()
-    room  = user_in_queue(user_id, queue)
-    if room:
-        del queue[room][user_id]
-        save_queue(queue)
-        _bot.answer_callback_query(call.id, "Бит отменён.")
-        _bot.send_message(call.message.chat.id, "✅ Бит удалён из очереди.", reply_markup=get_menu(user_id))
+    slot_id = user_in_registration(user_id)
+    beat    = find_active_beat_by_user(user_id)
+    if slot_id and beat:
+        remove_beat_from_registration(beat["id"])
+        update_beat_status(beat["id"], "paused")
+        _bot.answer_callback_query(call.id, "Бит поставлен на паузу.")
+        _bot.send_message(
+            call.message.chat.id,
+            "⏸️ Бит снят с набора и поставлен на паузу. Прогресс карьеры сохранён — "
+            "сможешь вернуть его в бой в любой момент кнопкой «⚔️ Мой батл».",
+            reply_markup=get_menu(user_id),
+        )
     else:
-        _bot.answer_callback_query(call.id, "Бит уже не в очереди.")
-        _bot.send_message(call.message.chat.id, "Бит уже не в очереди.", reply_markup=get_menu(user_id))
+        _bot.answer_callback_query(call.id, "Бит уже не в наборе.")
+        _bot.send_message(call.message.chat.id, "Бит уже не в наборе.", reply_markup=get_menu(user_id))
+
+
+def _handle_resume_paused(call):
+    user_id = str(call.from_user.id)
+    beat    = find_active_beat_by_user(user_id)
+
+    if not beat or beat["status"] != "paused":
+        _bot.answer_callback_query(call.id, "Нечего возвращать.")
+        return
+
+    slot_id = ensure_registration_slot()
+    register_beat_to_slot(slot_id, beat["id"])
+    update_beat_status(beat["id"], "queued")
+
+    _bot.answer_callback_query(call.id, "Бит возвращён в набор.")
+    try:
+        _bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+    _bot.send_message(
+        call.message.chat.id,
+        f"▶️ Бит вернулся в набор с сохранённым прогрессом "
+        f"({beat.get('battles_played', 0)}/{MAX_CAREER_BATTLES} батлов). Ждём старта слота.",
+        reply_markup=get_menu(user_id),
+    )
 
 
 def _receive_beat(message):
@@ -1329,12 +1358,10 @@ def _receive_beat(message):
         _bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
         return
 
-    edit_room = vote_context.get(f"editing_{user_id}")
-    if edit_room:
-        queue = load_queue()
-        if user_in_queue(user_id, queue) != edit_room:
+    if vote_context.get(f"editing_{user_id}"):
+        if not user_in_registration(user_id):
             vote_context.pop(f"editing_{user_id}", None)
-            _bot.send_message(message.chat.id, "⏳ Бит уже не в очереди — редактирование отменено.", reply_markup=get_menu(user_id))
+            _bot.send_message(message.chat.id, "⏳ Бит уже не в наборе — редактирование отменено.", reply_markup=get_menu(user_id))
             return
         if message.audio:
             file_id = message.audio.file_id
@@ -1345,13 +1372,11 @@ def _receive_beat(message):
         else:
             _bot.send_message(message.chat.id, "Пришли аудиофайл, чтобы заменить бит.")
             return
-        queue[edit_room][user_id] = file_id
-        save_queue(queue)
         active_beat = find_active_beat_by_user(user_id)
         if active_beat:
             update_beat_file(active_beat["id"], file_id)
         vote_context.pop(f"editing_{user_id}", None)
-        _bot.send_message(message.chat.id, "✅ Бит обновлён — ждём соперника с новым файлом.", reply_markup=get_menu(user_id))
+        _bot.send_message(message.chat.id, "✅ Бит обновлён в наборе.", reply_markup=get_menu(user_id))
         return
 
     if find_active_beat_by_user(user_id):
@@ -1406,106 +1431,31 @@ def _receive_beat(message):
     else:
         file_id = message.document.file_id
 
-    queue = load_queue()
-    if user_in_queue(user_id, queue):
-        _bot.send_message(message.chat.id, "⏳ Твой бит уже в очереди!", reply_markup=get_menu(user_id))
+    if user_in_registration(user_id):
+        _bot.send_message(message.chat.id, "⏳ Твой бит уже в наборе!", reply_markup=get_menu(user_id))
         return
 
+    # Слот игнорирует комнаты (мультикомнатность отложена — набор слота это
+    # плоский список beat_id без привязки к room). Выбор комнаты выше остаётся
+    # только UI-гейтом «сначала выбери, потом отправляй», дальше `room` не
+    # передаётся ни в create_beat, ни в слот. Матчинг на пары и создание
+    # батла переезжают в S3 (старт слота) — _pick_opponent/_beats_have_met
+    # здесь больше не вызываются, только определены на будущее.
     beat_id = create_beat(user_id, file_id)
+    slot_id = ensure_registration_slot()
+    register_beat_to_slot(slot_id, beat_id)
 
-    waiting = [uid for uid in queue[room] if uid != user_id]
-    candidates = []
-    for uid in waiting:
-        cand_beat = find_active_beat_by_user(uid)
-        if cand_beat and cand_beat["status"] == "queued":
-            candidates.append((uid, cand_beat))
-    opponent = _pick_opponent(beat_id, candidates)
+    u["votes_this_round"] = []
+    save_users(users)
+    consume_ticket(user_id)
 
-    if opponent:
-        opponent_id, opponent_beat_dict = opponent
-        opponent_beat_id = opponent_beat_dict["id"]
-        opponent_beat    = opponent_beat_dict["file_id"]
-        del queue[room][opponent_id]
-        save_queue(queue)
-
-        battles_data = load_battles()
-        bid          = f"battle_{len(battles_data) + 1}"
-        start_time   = datetime.now()
-
-        battles_data[bid] = {
-            "player1":       opponent_id,
-            "player2":       user_id,
-            "beat1_file_id": opponent_beat,
-            "beat2_file_id": file_id,
-            "beat1_id":      opponent_beat_id,
-            "beat2_id":      beat_id,
-            "votes1":        0,
-            "votes2":        0,
-            "voters":        {},
-            "votes":         {},
-            "predictions":   {},
-            "feedback":      {},
-            "status":        "active",
-            "room":          room,
-            "start_time":    start_time.isoformat(),
-        }
-        save_battles(battles_data)
-        update_beat_status(opponent_beat_id, "battling")
-        update_beat_status(beat_id, "battling")
-
-        _scheduler.add_job(
-            finish_battle,
-            "date",
-            run_date=start_time + timedelta(hours=get_battle_hours()),
-            args=[bid],
-            id=bid,
-            replace_existing=True,
-        )
-
-        today = datetime.now().date().isoformat()
-        for pid in [opponent_id, user_id]:
-            if pid in users:
-                if users[pid].get("last_battle_date") != today:
-                    users[pid]["battles_today"]    = 0
-                    users[pid]["last_battle_date"] = today
-                users[pid]["battles_today"]    = users[pid].get("battles_today", 0) + 1
-                users[pid]["votes_this_round"] = []
-
-        save_users(users)
-        consume_ticket(user_id)
-
-        p1_nick    = users.get(opponent_id, {}).get("nickname", "Соперник")
-        p2_nick    = users.get(user_id, {}).get("nickname", "Ты")
-
-        try:
-            _bot.send_message(
-                opponent_id,
-                f"⚔️ Батл начался!\n\n"
-                f"Твой соперник — {p2_nick}. Слушатели уже решают, кто сильнее.\n\n"
-                f"Голосование идёт {get_battle_hours()} часов — узнаешь результат, как только оно закроется.",
-            )
-        except Exception:
-            pass
-        _bot.send_message(
-            message.chat.id,
-            f"⚔️ Батл начался!\n\n"
-            f"Твой соперник — {p1_nick}. Слушатели уже решают, кто сильнее.\n\n"
-            f"Голосование идёт {get_battle_hours()} часов — узнаешь результат, как только оно закроется.",
-            reply_markup=get_menu(user_id),
-        )
-
-        _notify_new_battle(exclude_ids={opponent_id, user_id})
-    else:
-        queue[room][user_id] = file_id
-        save_queue(queue)
-        u["votes_this_round"] = []
-        save_users(users)
-        consume_ticket(user_id)
-        _bot.send_message(
-            message.chat.id,
-            f"✅ Бит принят!\n\nЖдём соперника — как только кто-то отправит свой, батл начнётся автоматически. ⏳",
-            reply_markup=get_menu(user_id),
-        )
+    _bot.send_message(
+        message.chat.id,
+        "✅ Бит принят в набор!\n\n"
+        "Как только слот наберётся и стартует — начнётся голосование. "
+        "Ты получишь уведомление. ⏳",
+        reply_markup=get_menu(user_id),
+    )
 
 
 def _vote_menu(message):
@@ -1568,9 +1518,20 @@ def _my_battle(message):
         _bot.send_message(message.chat.id, "Сначала зарегистрируйся — нажми /start")
         return
 
-    queue = load_queue()
-    if user_in_queue(user_id, queue):
-        _bot.send_message(message.chat.id, "⏳ Твой бит в очереди — ждём соперника.", reply_markup=get_menu(user_id))
+    if user_in_registration(user_id):
+        _bot.send_message(message.chat.id, "⏳ Твой бит в наборе — ждём старта слота.", reply_markup=get_menu(user_id))
+        return
+
+    paused_beat = find_active_beat_by_user(user_id)
+    if paused_beat and paused_beat["status"] == "paused":
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(telebot.types.InlineKeyboardButton("▶️ Вернуть бит в набор", callback_data="resume_paused"))
+        _bot.send_message(
+            message.chat.id,
+            f"⏸️ Твой бит на паузе.\n"
+            f"Прогресс: {paused_beat.get('battles_played', 0)}/{MAX_CAREER_BATTLES}",
+            reply_markup=markup,
+        )
         return
 
     _, b = find_user_battle(user_id)
@@ -1635,6 +1596,7 @@ def register_handlers(bot: telebot.TeleBot):
     bot.message_handler(content_types=["audio", "voice", "document"])(_receive_beat)
     bot.callback_query_handler(func=lambda c: c.data.startswith("room_"))(_handle_room_select)
     bot.callback_query_handler(func=lambda c: c.data in ["cancel_beat", "cancel_ignore"])(_handle_cancel_beat)
+    bot.callback_query_handler(func=lambda c: c.data == "resume_paused")(_handle_resume_paused)
     bot.callback_query_handler(func=lambda c: c.data.startswith("vote_"))(_handle_vote)
     bot.callback_query_handler(func=lambda c: c.data.startswith("pred_"))(_handle_prediction)
     bot.callback_query_handler(func=lambda c: c.data.startswith("nextpair_"))(_handle_next_pair)

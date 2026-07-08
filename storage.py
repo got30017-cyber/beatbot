@@ -672,14 +672,16 @@ def list_user_beats(user_id: str) -> list:
 
 
 def find_active_beat_by_user(user_id: str):
-    """Бит пользователя в 'queued'/'battling'/'awaiting_decision'. У пользователя
-    максимум один активный бит одновременно (инвариант поддерживается вызывающим
-    кодом в battles.py)."""
+    """Бит пользователя в 'queued'/'battling'/'awaiting_decision'/'paused'. У
+    пользователя максимум один активный бит одновременно (инвариант
+    поддерживается вызывающим кодом в battles.py). 'paused' считается активным
+    статусом — пока бит на паузе, новый отправить нельзя (одна карьера
+    единовременно; возможность держать паузный + новый бит — задел на S6)."""
     conn = _connect()
     try:
         row = conn.execute(
             "SELECT * FROM beats WHERE author_id = ? "
-            "AND status IN ('queued', 'battling', 'awaiting_decision') "
+            "AND status IN ('queued', 'battling', 'awaiting_decision', 'paused') "
             "ORDER BY created_at DESC LIMIT 1",
             (user_id,),
         ).fetchone()
@@ -1329,10 +1331,9 @@ def user_in_queue(user_id: str, queue: dict):
 
 
 def get_menu(user_id: str, bot_ref=None):
-    queue = load_queue()
-    in_q  = user_in_queue(str(user_id), queue) is not None
+    in_reg = user_in_registration(str(user_id)) is not None
 
-    beat_btn = "✏️ Редактировать бит" if in_q else "🎵 Отправить бит"
+    beat_btn = "✏️ Редактировать бит" if in_reg else "🎵 Отправить бит"
     markup   = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     markup.add(
         telebot.types.KeyboardButton(beat_btn),
