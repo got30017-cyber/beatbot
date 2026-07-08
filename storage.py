@@ -871,7 +871,7 @@ def register_beat_to_slot(slot_id: str, beat_id: str):
                 registered.append(beat_id)
                 conn.execute(
                     "UPDATE slots SET registered_beats = ? WHERE id = ?",
-                    (json.dumps(registered), slot_id),
+                    (json.dumps(registered, ensure_ascii=False), slot_id),
                 )
     finally:
         conn.close()
@@ -882,6 +882,62 @@ def set_slot_status(slot_id: str, status: str):
     try:
         with conn:
             conn.execute("UPDATE slots SET status = ? WHERE id = ?", (status, slot_id))
+    finally:
+        conn.close()
+
+
+def ensure_registration_slot() -> str:
+    """Возвращает id открытого registration-слота, лениво создавая новый,
+    если сейчас такого нет (например, идёт running-слот, а набор на
+    следующий ещё не начинался)."""
+    slot = get_open_registration_slot()
+    if slot:
+        return slot["id"]
+    return create_slot()
+
+
+def get_registration_beats() -> list:
+    """beat_id из набора текущего открытого registration-слота. Пустой список,
+    если открытого слота нет."""
+    slot = get_open_registration_slot()
+    return slot["registered_beats"] if slot else []
+
+
+def beat_in_registration(beat_id: str) -> bool:
+    return beat_id in get_registration_beats()
+
+
+def user_in_registration(user_id: str):
+    """Аналог user_in_queue для набора слота: если у пользователя есть активный
+    бит, который сейчас в наборе открытого registration-слота — возвращает
+    slot_id, иначе None."""
+    slot = get_open_registration_slot()
+    if not slot:
+        return None
+    beat = find_active_beat_by_user(user_id)
+    if not beat:
+        return None
+    if beat["id"] in slot["registered_beats"]:
+        return slot["id"]
+    return None
+
+
+def remove_beat_from_registration(beat_id: str):
+    """Убирает beat_id из набора текущего registration-слота. Идемпотентно —
+    если бита там нет, ничего не делает."""
+    slot = get_open_registration_slot()
+    if not slot:
+        return
+    if beat_id not in slot["registered_beats"]:
+        return
+    registered = [b for b in slot["registered_beats"] if b != beat_id]
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE slots SET registered_beats = ? WHERE id = ?",
+                (json.dumps(registered, ensure_ascii=False), slot["id"]),
+            )
     finally:
         conn.close()
 
