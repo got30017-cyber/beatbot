@@ -90,6 +90,21 @@ def _ensure_beat_columns(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE beats ADD COLUMN {col} {decl}")
 
 
+def _ensure_slot_columns(conn: sqlite3.Connection):
+    """Добавляет новые колонки slots в БД, созданную до их появления."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(slots)").fetchall()}
+    new_columns = {
+        "started_at":       "TEXT",
+        "voting_ends_at":   "TEXT",
+        "registered_beats": "TEXT DEFAULT '[]'",
+        "battle_ids":       "TEXT DEFAULT '[]'",
+        "finished_at":      "TEXT",
+    }
+    for col, decl in new_columns.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE slots ADD COLUMN {col} {decl}")
+
+
 # ─── Инициализация БД ────────────────────────
 
 def init_db():
@@ -231,6 +246,19 @@ def init_db():
                     finished_at       TEXT
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS slots (
+                    id                  TEXT PRIMARY KEY,
+                    status              TEXT NOT NULL,
+                    created_at          TEXT NOT NULL,
+                    started_at          TEXT,
+                    voting_ends_at      TEXT,
+                    registered_beats    TEXT DEFAULT '[]',
+                    battle_ids          TEXT DEFAULT '[]',
+                    finished_at         TEXT
+                )
+            """)
+            _ensure_slot_columns(conn)
     finally:
         conn.close()
 
@@ -745,6 +773,117 @@ def get_finished_weeks(limit: int = 10) -> list:
     finally:
         conn.close()
     return [_week_row_to_dict(r) for r in rows]
+
+
+# ─── Слоты (слотовая модель батлов) ──────────
+
+def _slot_row_to_dict(row) -> dict:
+    return {
+        "id":               row["id"],
+        "status":           row["status"],
+        "created_at":       row["created_at"],
+        "started_at":       row["started_at"],
+        "voting_ends_at":   row["voting_ends_at"],
+        "registered_beats": json.loads(row["registered_beats"] or "[]"),
+        "battle_ids":       json.loads(row["battle_ids"] or "[]"),
+        "finished_at":      row["finished_at"],
+    }
+
+
+def create_slot() -> str:
+    """Создаёт слот в статусе 'registration'. Возвращает slot_id."""
+    conn = _connect()
+    try:
+        with conn:
+            c = conn.execute("SELECT COUNT(*) AS c FROM slots").fetchone()["c"]
+            slot_id = f"slot_{c + 1}"
+            conn.execute(
+                "INSERT INTO slots (id, status, created_at) VALUES (?, 'registration', ?)",
+                (slot_id, datetime.now().isoformat()),
+            )
+    finally:
+        conn.close()
+    return slot_id
+
+
+def get_open_registration_slot():
+    """Слот в статусе registration; при нескольких — самый свежий по created_at."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM slots WHERE status = 'registration' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return _slot_row_to_dict(row) if row else None
+
+
+def get_running_slot():
+    """Слот в статусе running; при нескольких — самый свежий по created_at."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM slots WHERE status = 'running' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return _slot_row_to_dict(row) if row else None
+
+
+def get_slot(slot_id: str):
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM slots WHERE id = ?", (slot_id,)).fetchone()
+    finally:
+        conn.close()
+    return _slot_row_to_dict(row) if row else None
+
+
+def update_slot(slot_id: str, **fields):
+    """Точечный апдейт нескольких полей одной транзакцией. Значения для JSON-полей
+    (registered_beats/battle_ids) должны быть уже сериализованы вызывающим кодом."""
+    if not fields:
+        return
+    columns = ", ".join(f"{k} = ?" for k in fields)
+    values  = list(fields.values()) + [slot_id]
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute(f"UPDATE slots SET {columns} WHERE id = ?", values)
+    finally:
+        conn.close()
+
+
+def register_beat_to_slot(slot_id: str, beat_id: str):
+    """Добавляет beat_id в набор слота, если его там ещё нет (идемпотентно)."""
+    conn = _connect()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT registered_beats FROM slots WHERE id = ?", (slot_id,)
+            ).fetchone()
+            if row is None:
+                return
+            registered = json.loads(row["registered_beats"] or "[]")
+            if beat_id not in registered:
+                registered.append(beat_id)
+                conn.execute(
+                    "UPDATE slots SET registered_beats = ? WHERE id = ?",
+                    (json.dumps(registered), slot_id),
+                )
+    finally:
+        conn.close()
+
+
+def set_slot_status(slot_id: str, status: str):
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE slots SET status = ? WHERE id = ?", (status, slot_id))
+    finally:
+        conn.close()
 
 
 # ─── Finals ───────────────────────────────────

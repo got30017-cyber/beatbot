@@ -55,6 +55,10 @@ WEEK_VOTING_HOURS     = 48
 WEEK_MIN_QUALIFIED    = 3
 WEEK_MAX_PARTICIPANTS = 5
 
+# ─── Слотовая модель батлов ──────────────────
+SLOT_VOTING_HOURS     = 2   # дефолт: длительность фазы голосования слота (ч)
+SLOT_MIN_PARTICIPANTS = 2   # технический минимум битов для старта (меньше пары не бывает)
+
 # ─── Сообщения и уведомления ─────────────────
 MESSAGE_DAILY_LIMIT      = 5     # макс. исходящих личных сообщений в день на пользователя
 MESSAGE_COOLDOWN_MINUTES = 10    # мин. интервал между сообщениями одному и тому же адресату
@@ -85,3 +89,7 @@ def get_final_hours() -> int:
 
 def get_final_threshold() -> int:
     return int(_settings.get("final_threshold", FINAL_THRESHOLD))
+
+
+def get_slot_voting_hours() -> int:
+    return int(_settings.get("slot_voting_hours", SLOT_VOTING_HOURS))
