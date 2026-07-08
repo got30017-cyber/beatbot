@@ -1,3 +1,4 @@
+import json
 import random
 import telebot
 from datetime import datetime, timedelta
@@ -5,10 +6,10 @@ from datetime import datetime, timedelta
 from config import (
     ADMIN_ID, ROOMS, ROOM_LABELS,
     TICKET_FIRST, TICKET_CONTINUE, MAX_CAREER_BATTLES,
-    NOTIFY_THROTTLE_HOURS,
+    NOTIFY_THROTTLE_HOURS, SLOT_MIN_PARTICIPANTS,
     FEEDBACK_CATEGORIES, RATING_POINTS, RATING_LABELS, RATING_EMOJI,
     REFERRAL_RATING_BONUS, REFERRAL_MAX_REWARDS,
-    _settings, get_battle_hours,
+    _settings, get_battle_hours, get_slot_voting_hours,
 )
 from storage import (
     load_users, save_users,
@@ -24,6 +25,7 @@ from storage import (
     add_referral_reward, mark_referral_rewarded, pop_ticket_discount,
     ensure_registration_slot, get_registration_beats, beat_in_registration,
     user_in_registration, remove_beat_from_registration, register_beat_to_slot,
+    get_slot, update_slot, set_beat_priority,
 )
 
 _bot: telebot.TeleBot = None
@@ -1133,6 +1135,163 @@ def _pick_opponent(my_beat_id: str, candidates: list):
         return None
     fresh = [c for c in candidates if not _beats_have_met(my_beat_id, c[1]["id"])]
     return fresh[0] if fresh else candidates[0]
+
+
+def start_slot(slot_id: str):
+    """Бьёт набор слота на пары и создаёт батлы разом. Вызывается извне
+    (админ-кнопка добавится в S3.5) — здесь только логика разбивки.
+
+    Единый таймер: вместо индивидуального finish_battle на каждую пару
+    вешаем ОДИН таймер на finish_slot(slot_id) — весь слот завершается разом,
+    а не батлы вразнобой в разное время.
+
+    Возвращает (True, [bid, ...]) при успехе или (False, причина) если
+    слот уже не в registration или участников меньше SLOT_MIN_PARTICIPANTS.
+    """
+    slot = get_slot(slot_id)
+    if not slot or slot["status"] != "registration":
+        return False, "слот недоступен для старта"
+
+    beats = []
+    for beat_id in slot["registered_beats"]:
+        b = get_beat(beat_id)
+        # Защитно: бит мог быть снят с набора (пауза/отмена) уже после
+        # регистрации в слот, но раньше старта — статус тогда уже не queued.
+        if b and b["status"] == "queued":
+            beats.append(b)
+
+    if len(beats) < SLOT_MIN_PARTICIPANTS:
+        return False, "мало участников"
+
+    # Приоритетные (не попавшие в пару в прошлом слоте) паруются первыми —
+    # гарантия, что нечётный хвост не копится бесконечно на одном бите.
+    beats.sort(key=lambda b: 0 if b.get("priority_next_slot") else 1)
+
+    users        = load_users()
+    battles_data = load_battles()
+    today        = datetime.now().date().isoformat()
+
+    remaining           = list(beats)
+    created_battle_ids  = []
+    battle_participants = []   # [(bid, p1_id, p2_id), ...] — для пушей после сохранения
+
+    while len(remaining) >= 2:
+        beat = remaining.pop(0)
+        candidates = [(c["author_id"], c) for c in remaining]
+        opponent_id, opponent_beat = _pick_opponent(beat["id"], candidates)
+        remaining.remove(opponent_beat)
+
+        p1_id, p2_id = beat["author_id"], opponent_id
+        bid          = f"battle_{len(battles_data) + 1}"
+        start_time   = datetime.now()
+
+        battles_data[bid] = {
+            "player1":       p1_id,
+            "player2":       p2_id,
+            "beat1_file_id": beat["file_id"],
+            "beat2_file_id": opponent_beat["file_id"],
+            "beat1_id":      beat["id"],
+            "beat2_id":      opponent_beat["id"],
+            "votes1":        0,
+            "votes2":        0,
+            "voters":        {},
+            "votes":         {},
+            "predictions":   {},
+            "feedback":      {},
+            "status":        "active",
+            "room":          ROOMS[0],
+            "start_time":    start_time.isoformat(),
+        }
+        update_beat_status(beat["id"], "battling")
+        update_beat_status(opponent_beat["id"], "battling")
+        # Приоритет отработал — сбрасываем, чтобы не липнул на бит навсегда.
+        if beat.get("priority_next_slot"):
+            set_beat_priority(beat["id"], 0)
+        if opponent_beat.get("priority_next_slot"):
+            set_beat_priority(opponent_beat["id"], 0)
+
+        for pid in (p1_id, p2_id):
+            if pid in users:
+                if users[pid].get("last_battle_date") != today:
+                    users[pid]["battles_today"]    = 0
+                    users[pid]["last_battle_date"] = today
+                users[pid]["battles_today"]    = users[pid].get("battles_today", 0) + 1
+                users[pid]["votes_this_round"] = []
+
+        created_battle_ids.append(bid)
+        battle_participants.append((bid, p1_id, p2_id))
+
+    leftover_beat = remaining[0] if remaining else None
+
+    save_battles(battles_data)
+    save_users(users)
+
+    # Переводим слот в running ДО ensure_registration_slot() для нечётного
+    # остатка — иначе ensure_registration_slot() увидит этот же слот ещё в
+    # registration и вернёт его вместо создания нового.
+    start          = datetime.now()
+    voting_ends_at = start + timedelta(hours=get_slot_voting_hours())
+    update_slot(
+        slot_id,
+        status="running",
+        started_at=start.isoformat(),
+        voting_ends_at=voting_ends_at.isoformat(),
+        battle_ids=json.dumps(created_battle_ids, ensure_ascii=False),
+    )
+
+    if leftover_beat:
+        set_beat_priority(leftover_beat["id"], 1)
+        next_slot_id = ensure_registration_slot()
+        register_beat_to_slot(next_slot_id, leftover_beat["id"])
+        try:
+            _bot.send_message(
+                leftover_beat["author_id"],
+                "⏳ В этом слоте не хватило пары — твой бит приоритетный в следующем, сыграет гарантированно.",
+            )
+        except Exception:
+            pass
+
+    _scheduler.add_job(
+        finish_slot,
+        "date",
+        run_date=voting_ends_at,
+        args=[slot_id],
+        id=f"slot_{slot_id}",
+        replace_existing=True,
+    )
+
+    for bid, p1_id, p2_id in battle_participants:
+        p1_nick = users.get(p1_id, {}).get("nickname", "Соперник")
+        p2_nick = users.get(p2_id, {}).get("nickname", "Соперник")
+        try:
+            _bot.send_message(
+                p1_id,
+                f"⚔️ Слот стартовал! Твой бит в батле с {p2_nick}.\n\n"
+                f"Голосование идёт {get_slot_voting_hours()} ч — узнаешь результат, как только оно закроется.",
+            )
+        except Exception:
+            pass
+        try:
+            _bot.send_message(
+                p2_id,
+                f"⚔️ Слот стартовал! Твой бит в батле с {p1_nick}.\n\n"
+                f"Голосование идёт {get_slot_voting_hours()} ч — узнаешь результат, как только оно закроется.",
+            )
+        except Exception:
+            pass
+
+    # Все, чей бит был в этом наборе (спарен или ушёл приоритетным лишним),
+    # уже получили персональный пуш выше — не дублируем общим "новый батл".
+    all_registered_ids = {b["author_id"] for b in beats}
+    _notify_new_battle(exclude_ids=all_registered_ids)
+
+    return True, created_battle_ids
+
+
+def finish_slot(slot_id: str):
+    """S4 реализует расчёт всех пар слота и массовый пуш голосовавшим.
+    Пока заглушка — не вызывается вручную, только планировщиком после S4-деплоя."""
+    pass
 
 
 def _send_beat(message):

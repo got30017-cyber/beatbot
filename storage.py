@@ -81,9 +81,10 @@ def _ensure_beat_columns(conn: sqlite3.Connection):
     """Добавляет новые колонки beats в БД, созданную до их появления."""
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(beats)").fetchall()}
     new_columns = {
-        "week_id":         "TEXT",
-        "qualified_for":   "TEXT",
-        "final_placement": "INTEGER",
+        "week_id":            "TEXT",
+        "qualified_for":      "TEXT",
+        "final_placement":    "INTEGER",
+        "priority_next_slot": "INTEGER DEFAULT 0",
     }
     for col, decl in new_columns.items():
         if col not in existing:
@@ -221,9 +222,10 @@ def init_db():
                     predicted_for    INTEGER DEFAULT 0,
                     created_at       TEXT NOT NULL,
                     finished_at      TEXT,
-                    week_id          TEXT,
-                    qualified_for    TEXT,
-                    final_placement  INTEGER
+                    week_id             TEXT,
+                    qualified_for       TEXT,
+                    final_placement     INTEGER,
+                    priority_next_slot  INTEGER DEFAULT 0
                 )
             """)
             _ensure_beat_columns(conn)
@@ -528,9 +530,10 @@ def _beat_row_to_dict(row) -> dict:
         "predicted_for":   row["predicted_for"],
         "created_at":      row["created_at"],
         "finished_at":     row["finished_at"],
-        "week_id":         row["week_id"],
-        "qualified_for":   row["qualified_for"],
-        "final_placement": row["final_placement"],
+        "week_id":            row["week_id"],
+        "qualified_for":      row["qualified_for"],
+        "final_placement":    row["final_placement"],
+        "priority_next_slot": row["priority_next_slot"] or 0,
     }
 
 
@@ -604,6 +607,16 @@ def update_beat_status(beat_id: str, status: str):
     try:
         with conn:
             conn.execute("UPDATE beats SET status = ? WHERE id = ?", (status, beat_id))
+    finally:
+        conn.close()
+
+
+def set_beat_priority(beat_id: str, value: int):
+    """Флаг приоритета для следующего слота (нечётный остаток паруется первым)."""
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("UPDATE beats SET priority_next_slot = ? WHERE id = ?", (value, beat_id))
     finally:
         conn.close()
 
