@@ -384,47 +384,65 @@ def handle_view_profile(call):
 
 # ─── Рейтинг ──────────────────────────────────
 
-@bot.message_handler(commands=["rating"])
-@bot.message_handler(func=lambda m: m.text == "🏆 Рейтинг")
-def show_rating(message):
-    markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    for room, label in ROOM_LABELS.items():
-        markup.add(telebot.types.InlineKeyboardButton(label, callback_data=f"rating_room_{room}"))
-    markup.add(telebot.types.InlineKeyboardButton("🌍 Общий рейтинг", callback_data="rating_room_global"))
-    bot.send_message(message.chat.id, "🏆 Выбери комнату для рейтинга:", reply_markup=markup)
+def _build_global_rating_text() -> str:
+    """Общий рейтинг (топ-10 по u['rating']) — единственный вид рейтинга,
+    который сейчас показывает кнопка «🏆 Рейтинг». Комнатная развилка
+    (rating_room_<room>) — легаси мультикомнатной модели: сейчас комната
+    одна, выбирать нечего, поэтому кнопка ведёт сюда напрямую. Комнатный
+    рейтинг (handle_rating_room, room in ROOMS) остаётся в коде нетронутым
+    на будущее — вернётся при возврате мультикомнатности."""
+    users  = load_users()
+    medals = ["🥇", "🥈", "🥉"]
 
+    entries = [(uid, u, u.get("rating", 0), "очков") for uid, u in users.items()]
+    entries.sort(key=lambda x: x[2], reverse=True)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("rating_room_"))
-def handle_rating_room(call):
-    room         = call.data[len("rating_room_"):]
-    users        = load_users()
-    battles_data = load_battles()
-    medals       = ["🥇", "🥈", "🥉"]
-
-    if room == "global":
-        entries = [(uid, u, u.get("rating", 0), "очков") for uid, u in users.items()]
-        entries.sort(key=lambda x: x[2], reverse=True)
-        title = "🏆 Общий рейтинг"
-    elif room in ROOMS:
-        entries = []
-        for uid, u in users.items():
-            rw = get_room_wins(uid, battles_data)
-            entries.append((uid, u, rw[room], "побед"))
-        entries.sort(key=lambda x: x[2], reverse=True)
-        entries = [(uid, u, sc, suf) for uid, u, sc, suf in entries if sc > 0]
-        title = f"🏆 Топ {ROOM_LABELS[room]}"
-    else:
-        bot.answer_callback_query(call.id, "Неизвестная комната")
-        return
-
-    text = f"{title}\n\n"
+    text = "🏆 Общий рейтинг\n\n"
     for i, (uid, u, sc, suf) in enumerate(entries[:10]):
         medal       = medals[i] if i < 3 else f"{i + 1}."
         badge_emoji = get_badge(u.get("wins", 0), u.get("final_wins", 0)).split()[0]
         text       += f"{medal} {u['nickname']} {badge_emoji} — {sc} {suf}\n"
 
     if not entries:
-        text += "Пока нет данных для этой комнаты."
+        text += "Пока нет данных."
+    return text
+
+
+@bot.message_handler(commands=["rating"])
+@bot.message_handler(func=lambda m: m.text == "🏆 Рейтинг")
+def show_rating(message):
+    bot.send_message(message.chat.id, _build_global_rating_text())
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rating_room_"))
+def handle_rating_room(call):
+    room = call.data[len("rating_room_"):]
+
+    if room == "global":
+        text = _build_global_rating_text()
+    elif room in ROOMS:
+        battles_data = load_battles()
+        users        = load_users()
+        medals       = ["🥇", "🥈", "🥉"]
+
+        entries = []
+        for uid, u in users.items():
+            rw = get_room_wins(uid, battles_data)
+            entries.append((uid, u, rw[room], "побед"))
+        entries.sort(key=lambda x: x[2], reverse=True)
+        entries = [(uid, u, sc, suf) for uid, u, sc, suf in entries if sc > 0]
+
+        text = f"🏆 Топ {ROOM_LABELS[room]}\n\n"
+        for i, (uid, u, sc, suf) in enumerate(entries[:10]):
+            medal       = medals[i] if i < 3 else f"{i + 1}."
+            badge_emoji = get_badge(u.get("wins", 0), u.get("final_wins", 0)).split()[0]
+            text       += f"{medal} {u['nickname']} {badge_emoji} — {sc} {suf}\n"
+
+        if not entries:
+            text += "Пока нет данных для этой комнаты."
+    else:
+        bot.answer_callback_query(call.id, "Неизвестная комната")
+        return
 
     try:
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id)

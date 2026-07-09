@@ -26,6 +26,7 @@ from storage import (
     ensure_registration_slot, get_registration_beats, beat_in_registration,
     user_in_registration, remove_beat_from_registration, register_beat_to_slot,
     get_slot, update_slot, set_beat_priority,
+    get_running_slot,
 )
 
 _bot: telebot.TeleBot = None
@@ -940,7 +941,7 @@ def _send_vote_summary(chat_id, user_id: str, bid: str, vote_side: str, pred_sid
     text = (
         f"❤️ Твой выбор: Бит {vote_side}\n"
         f"🧠 Твой прогноз: Бит {pred_side}\n\n"
-        f"Узнаешь, угадал ли — как только батл завершится (~{get_battle_hours()} ч). "
+        f"Узнаешь, угадал ли — как только батл завершится (~{get_slot_voting_hours()} ч). "
         f"А в конце недели — полная сводка твоей интуиции. 🤫"
     )
 
@@ -1850,7 +1851,7 @@ def _my_battle(message):
         )
         return
 
-    _, b = find_user_battle(user_id)
+    bid, b = find_user_battle(user_id)
     if not b:
         _bot.send_message(
             message.chat.id,
@@ -1877,9 +1878,17 @@ def _my_battle(message):
 
     time_line = ""
     if b.get("status") == "active":
-        start_time = datetime.fromisoformat(b["start_time"])
-        end_time   = start_time + timedelta(hours=get_battle_hours())
-        remaining  = end_time - datetime.now()
+        # Время завершения принадлежит слоту (voting_ends_at), а не батлу —
+        # единый таймер вешается на весь слот в start_slot. Fallback на
+        # старую батл-таймерную логику только для осиротевших легаси-батлов
+        # без своего running-слота (созданных до слотовой модели).
+        slot = get_running_slot()
+        if slot and slot.get("voting_ends_at") and bid in slot.get("battle_ids", []):
+            end_time = datetime.fromisoformat(slot["voting_ends_at"])
+        else:
+            start_time = datetime.fromisoformat(b["start_time"])
+            end_time   = start_time + timedelta(hours=get_battle_hours())
+        remaining = end_time - datetime.now()
         if remaining.total_seconds() > 0:
             hours_left   = int(remaining.total_seconds() // 3600)
             minutes_left = int((remaining.total_seconds() % 3600) // 60)
