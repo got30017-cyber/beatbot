@@ -386,23 +386,41 @@ def _maybe_reward_referral(player_id: str, users: dict, battles_data: dict, bid:
 
 # ─── Завершение батла ─────────────────────────
 
-def finish_battle(bid: str):
+def _settle_battle(bid: str):
+    """Расчётная часть завершения батла: победитель, начисление рейтинга/
+    побед, карьерный шаг бита, реферальная награда. Никаких пушей о
+    результате (победа/поражение/ничья автору, прогноз голосовавшим) —
+    их собирает вызывающий код (finish_battle или finish_slot) из
+    возвращённого словаря, чтобы не считать один батл дважды.
+
+    Исключение: _run_beat_career_steps и _maybe_reward_referral сами шлют
+    сообщения (карьерное решение автору, награда рефереру) — это отдельные,
+    самодостаточные уведомления, не завязанные на способ доставки основного
+    результата (одиночный пуш vs пакетный пуш слота), поэтому остаются здесь
+    как в оригинале, а не переезжают к вызывающему коду.
+
+    Возвращает None, если батл уже не active (повторный вызов/гонка).
+    """
     battles = load_battles()
     users   = load_users()
 
     b = battles.get(bid)
     if not b or b["status"] != "active":
-        return
+        return None
 
     b["status"]   = "finished"
     b["end_time"] = datetime.now().isoformat()
-    room          = b.get("room", "")
 
     votes1  = b.get("votes1", 0)
     votes2  = b.get("votes2", 0)
     p1, p2  = b["player1"], b["player2"]
     p1_nick = users.get(p1, {}).get("nickname", "Игрок 1")
     p2_nick = users.get(p2, {}).get("nickname", "Игрок 2")
+
+    winner_id = loser_id = None
+    winner_nick = loser_nick = None
+    winner_votes = loser_votes = None
+    winner_side = loser_side = None
 
     if votes1 > votes2:
         winning_side                 = 1
@@ -421,32 +439,7 @@ def finish_battle(bid: str):
 
     resolve_pair_ratings(bid, str(winning_side))
 
-    # Мгновенный пуш о результате прогноза — каждому, кто голосовал в этом батле.
-    # Еженедельная агрегированная сводка интуиции (build_intuition_summary) остаётся
-    # отдельной и без изменений — это бонус-статистика поверх мгновенного результата.
-    for voter_id, pred_side in b.get("predictions", {}).items():
-        # Защита избыточна (автор не может голосовать в своём батле), но не помешает.
-        if voter_id in (p1, p2):
-            continue
-        if winning_side == 0:
-            pred_text = (
-                "🤔 Батл, где ты голосовал, завершился вничью — "
-                "прогноз не засчитан ни в плюс, ни в минус."
-            )
-        elif str(pred_side) == str(winning_side):
-            pred_text = (
-                "✅ Твой прогноз сбылся! Сообщество выбрало именно тот бит, "
-                "на который ты поставил в прогнозе. 🧠"
-            )
-        else:
-            pred_text = (
-                "❌ Не в этот раз — сообщество выбрало другой бит, чем твой прогноз. "
-                "Попробуешь угадать в следующей паре?"
-            )
-        try:
-            _bot.send_message(voter_id, pred_text)
-        except Exception:
-            pass
+    predictions_snapshot = dict(b.get("predictions", {}))
 
     # +1 рейтинг тем, чей ПРОГНОЗ совпал с победившей стороной.
     # Награда перенесена с голоса на прогноз: награда за «правильный» голос
@@ -456,41 +449,80 @@ def finish_battle(bid: str):
             if uid_str in users and pred_side == str(winning_side):
                 users[uid_str]["rating"] = users[uid_str].get("rating", 0) + 1
 
-    if winning_side == 0:
-        total = votes1 + votes2
-        save_battles(battles)
-        save_users(users)
-        for pid in [p1, p2]:
-            if pid in users:
-                try:
-                    _bot.send_message(
-                        pid,
-                        f"🤝 Батл завершён — ничья!\n\n"
-                        f"{p1_nick} — {votes1} голосов\n"
-                        f"{p2_nick} — {votes2} голосов\n\n"
-                        f"Бывает и так — иногда сообщество раскалывается ровно пополам. "
-                        f"Держись, следующий батл может расставить всё по местам.",
-                    )
-                except Exception:
-                    pass
-        _run_beat_career_steps(b, winning_side)
-        for pid in [p1, p2]:
-            _maybe_reward_referral(pid, users, battles, bid)
-        return
-
-    if winner_id in users:
-        users[winner_id]["rating"] = users[winner_id].get("rating", 0) + 10
-        users[winner_id]["wins"]   = users[winner_id].get("wins", 0) + 1
-
-    b["counted_for_final"] = True
+        if winner_id in users:
+            users[winner_id]["rating"] = users[winner_id].get("rating", 0) + 10
+            users[winner_id]["wins"]   = users[winner_id].get("wins", 0) + 1
+        b["counted_for_final"] = True
 
     save_battles(battles)
     save_users(users)
 
+    new_rating = users.get(winner_id, {}).get("rating", 0) if winning_side != 0 else None
+
+    _run_beat_career_steps(b, winning_side)
+
+    for pid in [p1, p2]:
+        _maybe_reward_referral(pid, users, battles, bid)
+
+    # финалы упразднены — квалификация теперь по неделям, см. weeks.py
+
+    return {
+        "bid": bid,
+        "winning_side": winning_side,
+        "p1": p1, "p2": p2,
+        "p1_nick": p1_nick, "p2_nick": p2_nick,
+        "votes1": votes1, "votes2": votes2,
+        "predictions": predictions_snapshot,
+        "winner_id": winner_id, "loser_id": loser_id,
+        "winner_nick": winner_nick, "loser_nick": loser_nick,
+        "winner_votes": winner_votes, "loser_votes": loser_votes,
+        "winner_side": winner_side, "loser_side": loser_side,
+        "new_rating": new_rating,
+        "b": b,
+    }
+
+
+def _send_author_battle_result(outcome: dict):
+    """Пуш(и) автору(ам) бита о результате батла — победа/поражение/ничья,
+    с процентами голосов и фидбек-сводкой. Общий хелпер для finish_battle
+    (легаси, один батл за раз) и finish_slot (пачка батлов слота) — тексты
+    идентичны тем, что были в finish_battle до выделения _settle_battle."""
+    b            = outcome["b"]
+    p1, p2       = outcome["p1"], outcome["p2"]
+    p1_nick      = outcome["p1_nick"]
+    p2_nick      = outcome["p2_nick"]
+    votes1       = outcome["votes1"]
+    votes2       = outcome["votes2"]
+    winning_side = outcome["winning_side"]
+
+    if winning_side == 0:
+        for pid in [p1, p2]:
+            try:
+                _bot.send_message(
+                    pid,
+                    f"🤝 Батл завершён — ничья!\n\n"
+                    f"{p1_nick} — {votes1} голосов\n"
+                    f"{p2_nick} — {votes2} голосов\n\n"
+                    f"Бывает и так — иногда сообщество раскалывается ровно пополам. "
+                    f"Держись, следующий батл может расставить всё по местам.",
+                )
+            except Exception:
+                pass
+        return
+
+    winner_id    = outcome["winner_id"]
+    loser_id     = outcome["loser_id"]
+    winner_nick  = outcome["winner_nick"]
+    loser_nick   = outcome["loser_nick"]
+    winner_votes = outcome["winner_votes"]
+    loser_votes  = outcome["loser_votes"]
+    winner_side  = outcome["winner_side"]
+    loser_side   = outcome["loser_side"]
+    new_rating   = outcome["new_rating"]
+
     total      = winner_votes + loser_votes
     winner_pct = round(winner_votes / total * 100) if total > 0 else 0
     loser_pct  = 100 - winner_pct
-    new_rating = users.get(winner_id, {}).get("rating", 0)
 
     winner_summary = _feedback_summary_text(b, winner_side)
     loser_summary  = _feedback_summary_text(b, loser_side)
@@ -522,12 +554,46 @@ def finish_battle(bid: str):
     except Exception:
         pass
 
-    _run_beat_career_steps(b, winning_side)
 
-    for pid in [p1, p2]:
-        _maybe_reward_referral(pid, users, battles, bid)
+def finish_battle(bid: str):
+    """Легаси-путь: завершение ОДНОГО батла вне слотовой модели (осиротевшие
+    батлы старой очереди — см. restore_timers в bot.py). В слотовой модели
+    группу батлов слота завершает finish_slot одним вызовом."""
+    outcome = _settle_battle(bid)
+    if outcome is None:
+        return
 
-    # финалы упразднены — квалификация теперь по неделям, см. weeks.py
+    winning_side = outcome["winning_side"]
+    p1, p2       = outcome["p1"], outcome["p2"]
+
+    # Мгновенный пуш о результате прогноза — каждому, кто голосовал в этом батле.
+    # Еженедельная агрегированная сводка интуиции (build_intuition_summary) остаётся
+    # отдельной и без изменений — это бонус-статистика поверх мгновенного результата.
+    for voter_id, pred_side in outcome["predictions"].items():
+        # Защита избыточна (автор не может голосовать в своём батле), но не помешает.
+        if voter_id in (p1, p2):
+            continue
+        if winning_side == 0:
+            pred_text = (
+                "🤔 Батл, где ты голосовал, завершился вничью — "
+                "прогноз не засчитан ни в плюс, ни в минус."
+            )
+        elif str(pred_side) == str(winning_side):
+            pred_text = (
+                "✅ Твой прогноз сбылся! Сообщество выбрало именно тот бит, "
+                "на который ты поставил в прогнозе. 🧠"
+            )
+        else:
+            pred_text = (
+                "❌ Не в этот раз — сообщество выбрало другой бит, чем твой прогноз. "
+                "Попробуешь угадать в следующей паре?"
+            )
+        try:
+            _bot.send_message(voter_id, pred_text)
+        except Exception:
+            pass
+
+    _send_author_battle_result(outcome)
 
 
 def _force_finish_battle(bid: str, winning_side: int):
@@ -1289,9 +1355,72 @@ def start_slot(slot_id: str):
 
 
 def finish_slot(slot_id: str):
-    """S4 реализует расчёт всех пар слота и массовый пуш голосовавшим.
-    Пока заглушка — не вызывается вручную, только планировщиком после S4-деплоя."""
-    pass
+    """Завершает слот целиком: считает исход каждого батла слота через
+    _settle_battle, шлёт голосовавшим ОДНО сводное сообщение по всем батлам,
+    где они голосовали (вместо пер-батловых пушей прогноза из finish_battle),
+    авторам — обычный пуш о результате их бита, сбрасывает голосовые сессии
+    и переводит слот в finished."""
+    slot = get_slot(slot_id)
+    if not slot or slot["status"] != "running":
+        return
+
+    outcomes = []
+    for bid in slot["battle_ids"]:
+        outcome = _settle_battle(bid)
+        if outcome is not None:
+            outcomes.append(outcome)
+
+    # voter_id -> [строка по батлу 1, строка по батлу 2, ...] — порядок
+    # батлов слота сохраняется для нумерации в сводке.
+    voter_lines: dict = {}
+    for outcome in outcomes:
+        b            = outcome["b"]
+        p1, p2       = outcome["p1"], outcome["p2"]
+        p1_nick      = outcome["p1_nick"]
+        p2_nick      = outcome["p2_nick"]
+        votes1       = outcome["votes1"]
+        votes2       = outcome["votes2"]
+        winning_side = outcome["winning_side"]
+        votes        = b.get("votes", {})
+
+        for voter_id, pred_side in outcome["predictions"].items():
+            if voter_id in (p1, p2):
+                continue
+            vote_side  = votes.get(voter_id)
+            voted_nick = p1_nick if vote_side == "1" else (p2_nick if vote_side == "2" else "?")
+
+            if winning_side == 0:
+                verdict = "🤝 ничья"
+            elif str(pred_side) == str(winning_side):
+                verdict = "✅ угадал большинство"
+            else:
+                verdict = "❌ большинство выбрало другого"
+
+            line = f"{p1_nick} ({votes1}) 🆚 {p2_nick} ({votes2}) — ты голосовал за {voted_nick}, {verdict}."
+            voter_lines.setdefault(voter_id, []).append(line)
+
+    for voter_id, lines in voter_lines.items():
+        numbered = "\n".join(f"{i}. {line}" for i, line in enumerate(lines, start=1))
+        try:
+            _bot.send_message(
+                voter_id,
+                f"🏁 Слот завершён! Итоги батлов, где ты голосовал:\n\n{numbered}",
+            )
+        except Exception:
+            pass
+
+    for outcome in outcomes:
+        _send_author_battle_result(outcome)
+
+    # Сессионные сбросы для завершённого голосования — на пилоте одно активное
+    # голосование одновременно, глобальная очистка безопасна (перенесено из
+    # упразднённого _admin_stop_round, см. S3.5).
+    vote_session.clear()
+    pending_prediction.clear()
+    pair_shown_at.clear()
+    voted_at.clear()
+
+    update_slot(slot_id, status="finished", finished_at=datetime.now().isoformat())
 
 
 def _send_beat(message):
