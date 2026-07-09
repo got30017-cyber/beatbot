@@ -16,7 +16,7 @@ from config import (
 )
 from storage import (
     load_users, save_users,
-    load_battles, save_battles,
+    load_battles,
     load_finals,
     default_user, get_badge, get_room_wins,
     get_menu,
@@ -27,6 +27,7 @@ from storage import (
     get_current_week,
     set_referred_by,
     get_open_registration_slot, get_running_slot,
+    ensure_registration_slot, register_beat_to_slot, find_active_beat_by_user,
 )
 import battles
 import weeks
@@ -598,6 +599,7 @@ def admin_panel(message):
         telebot.types.InlineKeyboardButton("🛑 Завершить слот сейчас",  callback_data="admin_finish_slot"),
         telebot.types.InlineKeyboardButton("🏆 Остановить финал",       callback_data="admin_stop_final"),
         telebot.types.InlineKeyboardButton("👤 Тест-пользователи",      callback_data="admin_test_users"),
+        telebot.types.InlineKeyboardButton("📊 Статистика",             callback_data="admin_stats"),
         telebot.types.InlineKeyboardButton("⏱ Время батлов",            callback_data="admin_set_time"),
         telebot.types.InlineKeyboardButton("🏆 Порог финала",           callback_data="admin_set_threshold"),
         telebot.types.InlineKeyboardButton("🧪 Закрыть неделю",         callback_data="admin_force_close_week"),
@@ -697,6 +699,30 @@ def handle_admin_actions(call):
     elif call.data == "admin_test_users":
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, _create_test_users())
+
+    elif call.data == "admin_stats":
+        bot.answer_callback_query(call.id)
+        users = load_users()
+        total = len(users)
+        with_active_beat = sum(1 for uid in users if find_active_beat_by_user(uid))
+
+        reg_slot        = get_open_registration_slot()
+        in_registration = len(reg_slot["registered_beats"]) if reg_slot else 0
+
+        running_slot    = get_running_slot()
+        running_battles = len(running_slot["battle_ids"]) if running_slot else 0
+
+        voted_now = sum(1 for u in users.values() if u.get("votes_this_round"))
+
+        bot.send_message(
+            call.message.chat.id,
+            f"📊 Статистика\n\n"
+            f"👥 Всего пользователей: {total}\n"
+            f"🎧 С активным битом: {with_active_beat}\n"
+            f"🎯 В наборе на слот: {in_registration}\n"
+            f"⚔️ В текущем слоте (батлов): {running_battles}\n"
+            f"🗳 Проголосовало в этом цикле: {voted_now}",
+        )
 
     elif call.data.startswith("admin_del_beat_"):
         rest        = call.data[len("admin_del_beat_"):]
@@ -872,17 +898,12 @@ def _admin_stop_final(fid: str) -> str:
 
 
 def _create_test_users() -> str:
-    users        = load_users()
-    battles_data = load_battles()
-
-    def _has_active_battle(p1: str, p2: str) -> bool:
-        return any(
-            b.get("status") == "active" and {b.get("player1"), b.get("player2")} == {p1, p2}
-            for b in battles_data.values()
-        )
-
-    if "test_1" in users and _has_active_battle("test_1", "test_2"):
-        return "ℹ️ Тестовые пользователи и батлы уже существуют.\n\nНажми 🗳 Голосовать, чтобы их увидеть."
+    """Кладёт тестовые биты в набор registration-слота вместо создания
+    батлов напрямую — слотовую модель нельзя обойти стороной, весь цикл
+    (набор → старт → голосование → finish_slot) должен проходить через
+    настоящий battles.start_slot(), который админ запускает вручную
+    кнопкой ▶️ Запустить слот."""
+    users = load_users()
 
     created_users = []
     for i in range(1, 7):
@@ -892,75 +913,53 @@ def _create_test_users() -> str:
             u["role"]  = "beatmaker"
             users[uid] = u
             created_users.append(f"TestBeat{i}")
-    save_users(users)
 
-    created_battles  = 0
-    created_beat_ids = []
-    for a, b_idx in [(1, 2), (3, 4), (5, 6)]:
-        p1, p2 = f"test_{a}", f"test_{b_idx}"
-        if _has_active_battle(p1, p2):
+    registered_beats = 0
+    for i in range(1, 7):
+        uid = f"test_{i}"
+        if find_active_beat_by_user(uid):
             continue
+        beat_id = battles.create_beat(uid, f"TEST_FAKE_FILE_{i}")
+        slot_id = ensure_registration_slot()
+        register_beat_to_slot(slot_id, beat_id)
+        registered_beats += 1
 
-        beat1_id = battles.create_beat(p1, f"TEST_FAKE_FILE_{a}")
-        beat2_id = battles.create_beat(p2, f"TEST_FAKE_FILE_{b_idx}")
-        battles.update_beat_status(beat1_id, "battling")
-        battles.update_beat_status(beat2_id, "battling")
-        created_beat_ids.append(beat1_id)
-        created_beat_ids.append(beat2_id)
-
-        bid        = f"battle_{len(battles_data) + 1}"
-        start_time = datetime.now()
-        battles_data[bid] = {
-            "player1":       p1,
-            "player2":       p2,
-            "beat1_file_id": f"TEST_FAKE_FILE_{a}",
-            "beat2_file_id": f"TEST_FAKE_FILE_{b_idx}",
-            "beat1_id":      beat1_id,
-            "beat2_id":      beat2_id,
-            "votes1":        0,
-            "votes2":        0,
-            "voters":        {},
-            "votes":         {},
-            "predictions":   {},
-            "feedback":      {},
-            "status":        "active",
-            "room":          ROOMS[0],
-            "start_time":    start_time.isoformat(),
-        }
-        save_battles(battles_data)
-
-        scheduler.add_job(
-            battles.finish_battle,
-            "date",
-            run_date=start_time + timedelta(hours=get_battle_hours()),
-            args=[bid],
-            id=bid,
-            replace_existing=True,
-        )
-        created_battles += 1
-
-    # Доводим 4 тестовых бита до career_finished напрямую (минуя обычный флоу
-    # завершения батла) — так квалификация для Бита недели наполняется сразу,
-    # без ожидания реальных батлов. week_id проставляется автоматически в
-    # create_beat() на текущую неделю.
+    # Квалификационные биты для Бита недели — отдельные тест-юзеры
+    # (testq_1..testq_4), НЕ регистрируются в слот и никогда не участвуют в
+    # реальном слотовом флоу: доводятся до career_finished напрямую, минуя
+    # обычное завершение батла, чтобы квалификация наполнялась сразу.
     finished_test_beats = 0
-    for beat_id, result in zip(created_beat_ids[:4], ["win", "loss", "win", "draw"]):
+    for i, result in zip(range(1, 5), ["win", "loss", "win", "draw"]):
+        uid = f"testq_{i}"
+        if uid not in users:
+            u          = default_user(f"TestQualify{i}")
+            u["role"]  = "beatmaker"
+            users[uid] = u
+        if list_user_beats(uid):
+            continue
+        beat_id = battles.create_beat(uid, f"TEST_QUALIFY_FILE_{i}")
         battles.record_beat_battle_result(beat_id, result)
         battles.finish_beat_career(beat_id)
         finished_test_beats += 1
+
+    save_users(users)
+
+    slot            = get_open_registration_slot()
+    in_registration = len(slot["registered_beats"]) if slot else 0
 
     lines = []
     if created_users:
         lines.append(f"✅ Тест-пользователей создано: {len(created_users)}")
     else:
         lines.append("ℹ️ Тест-пользователи уже существовали.")
-    if created_battles:
-        lines.append(f"✅ Тестовых батлов создано: {created_battles}")
+    if registered_beats:
+        lines.append(f"✅ Тестовых битов добавлено в набор: {registered_beats}")
     else:
-        lines.append("ℹ️ Тестовые батлы уже существовали.")
+        lines.append("ℹ️ Тестовые биты уже были в наборе (или уже в игре).")
+    lines.append(f"🎯 Сейчас в наборе на слот: {in_registration}")
     if finished_test_beats:
         lines.append(f"✅ Тестовых карьер завершено (квалификация для Бита недели): {finished_test_beats}")
-    lines.append("\nНажми 🗳 Голосовать, чтобы их увидеть.")
+    lines.append("\nТеперь нажми ▶️ Запустить слот в админке, чтобы разбить набор на пары.")
     return "\n".join(lines)
 
 
