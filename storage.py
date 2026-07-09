@@ -1252,6 +1252,92 @@ def pop_ticket_discount(user_id: str) -> int:
     return 1
 
 
+# ─── Сброс данных (админ-утилиты) ────────────
+
+def reset_test_data() -> dict:
+    """Безопасная чистка ТОЛЬКО тестовых данных. Реальных пользователей не
+    трогает: id пользователей — числовой telegram id, поэтому префикс
+    'test' по id никогда не пересекается с реальным пользователем (ники —
+    отдельное поле, не участвуют в отборе).
+
+    Registration-слоты, существовавшие только ради тестового набора
+    (после удаления тестовых битов их registered_beats стал пустым),
+    удаляются вместе с остальными тестовыми данными. Running/finished
+    слоты не трогаются вовсе — чистка ограничена статусом registration.
+    Если в смешанном (реальные+тестовые биты) registration-слоте остаётся
+    "хвост" из уже удалённых test beat_id в JSON-списке — это безвредно:
+    start_slot уже терпимо относится к отсутствующим beat_id (get_beat
+    возвращает None, такой beat_id просто пропускается при разбивке на
+    пары), поэтому здесь список не переписывается.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            test_beat_ids = {
+                row["id"] for row in
+                conn.execute("SELECT id FROM beats WHERE author_id LIKE 'test%'").fetchall()
+            }
+            users_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM users WHERE id LIKE 'test%'"
+            ).fetchone()["c"]
+            battles_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM battles WHERE player1 LIKE 'test%' OR player2 LIKE 'test%'"
+            ).fetchone()["c"]
+
+            conn.execute(
+                "DELETE FROM pair_ratings WHERE user_id LIKE 'test%' "
+                "OR battle_id IN (SELECT id FROM battles WHERE player1 LIKE 'test%' OR player2 LIKE 'test%')"
+            )
+            conn.execute("DELETE FROM battles WHERE player1 LIKE 'test%' OR player2 LIKE 'test%'")
+            conn.execute("DELETE FROM beats WHERE author_id LIKE 'test%'")
+            conn.execute("DELETE FROM users WHERE id LIKE 'test%'")
+
+            slots_deleted = 0
+            for row in conn.execute(
+                "SELECT id, registered_beats FROM slots WHERE status = 'registration'"
+            ).fetchall():
+                registered = json.loads(row["registered_beats"] or "[]")
+                remaining  = [bid for bid in registered if bid not in test_beat_ids]
+                if not remaining:
+                    conn.execute("DELETE FROM slots WHERE id = ?", (row["id"],))
+                    slots_deleted += 1
+    finally:
+        conn.close()
+
+    return {
+        "users":   users_count,
+        "beats":   len(test_beat_ids),
+        "battles": battles_count,
+        "slots":   slots_deleted,
+    }
+
+
+def wipe_all_data() -> dict:
+    """Полный снос ВСЕХ данных — для чистого старта на пилоте. Таблицы
+    (схема) остаются, удаляются только строки — при следующем обращении
+    бот работает с пустой, но валидной БД.
+
+    settings тоже очищается — флаг _short_durations_applied пропадёт, и
+    при следующем старте бот заново применит стартовые длительности
+    батла/финала. Это ожидаемо, не баг.
+    """
+    conn = _connect()
+    try:
+        with conn:
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM battles")
+            conn.execute("DELETE FROM queue")
+            conn.execute("DELETE FROM finals")
+            conn.execute("DELETE FROM settings")
+            conn.execute("DELETE FROM pair_ratings")
+            conn.execute("DELETE FROM beats")
+            conn.execute("DELETE FROM weeks")
+            conn.execute("DELETE FROM slots")
+    finally:
+        conn.close()
+    return {"wiped": True}
+
+
 # ─── Вспомогательные функции ─────────────────
 
 def get_badge(wins: int, final_wins: int) -> str:

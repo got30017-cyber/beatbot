@@ -28,6 +28,7 @@ from storage import (
     set_referred_by,
     get_open_registration_slot, get_running_slot,
     ensure_registration_slot, register_beat_to_slot, find_active_beat_by_user,
+    reset_test_data, wipe_all_data,
 )
 import battles
 import weeks
@@ -599,6 +600,7 @@ def admin_panel(message):
         telebot.types.InlineKeyboardButton("🛑 Завершить слот сейчас",  callback_data="admin_finish_slot"),
         telebot.types.InlineKeyboardButton("🏆 Остановить финал",       callback_data="admin_stop_final"),
         telebot.types.InlineKeyboardButton("👤 Тест-пользователи",      callback_data="admin_test_users"),
+        telebot.types.InlineKeyboardButton("🧹 Сбросить тестовые данные", callback_data="admin_reset_test"),
         telebot.types.InlineKeyboardButton("📊 Статистика",             callback_data="admin_stats"),
         telebot.types.InlineKeyboardButton("⏱ Время батлов",            callback_data="admin_set_time"),
         telebot.types.InlineKeyboardButton("🏆 Порог финала",           callback_data="admin_set_threshold"),
@@ -700,6 +702,27 @@ def handle_admin_actions(call):
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, _create_test_users())
 
+    elif call.data == "admin_reset_test":
+        markup = telebot.types.InlineKeyboardMarkup()
+        markup.add(
+            telebot.types.InlineKeyboardButton("✅ Да, очистить тест", callback_data="admin_confirm_reset_test"),
+            telebot.types.InlineKeyboardButton("❌ Отмена",            callback_data="admin_cancel"),
+        )
+        bot.edit_message_text(
+            "⚠️ Удалить тестовых пользователей (test_*/testq_*) и всё, что с ними связано "
+            "(биты, батлы, пустые registration-слоты)?\n\nРеальных пользователей не тронет. Подтверждаешь?",
+            call.message.chat.id, call.message.message_id, reply_markup=markup,
+        )
+
+    elif call.data == "admin_confirm_reset_test":
+        bot.edit_message_text("⏳ Чищу тестовые данные...", call.message.chat.id, call.message.message_id)
+        result = reset_test_data()
+        bot.send_message(
+            call.message.chat.id,
+            f"🧹 Удалено: юзеров {result['users']}, битов {result['beats']}, "
+            f"батлов {result['battles']}, слотов {result['slots']}.",
+        )
+
     elif call.data == "admin_stats":
         bot.answer_callback_query(call.id)
         users = load_users()
@@ -773,6 +796,26 @@ def handle_admin_actions(call):
 
     elif call.data == "admin_cancel":
         bot.edit_message_text("Отменено.", call.message.chat.id, call.message.message_id)
+
+
+# ВРЕМЕННО: команда полного сноса БД для чистого старта на пилоте. Не кнопка
+# (в отличие от остального админ-инструментария) — намеренно, чтобы её нельзя
+# было случайно нажать в панели. Убрать перед публичным запуском — держать в
+# проде команду полного сноса БД опасно.
+@bot.message_handler(commands=["wipe_all_confirm"])
+def cmd_wipe_all(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    # Снять все слот/батл/недельные таймеры перед сносом, чтобы планировщик
+    # не дёргал finish_slot/finish_battle по уже удалённым id.
+    scheduler.remove_all_jobs()
+    wipe_all_data()
+    bot.send_message(
+        message.chat.id,
+        "💥 Вся БД очищена. Все пользователи, биты, батлы, слоты, недели удалены.\n\n"
+        "Перезапусти бота (или он сам создаст новую неделю при следующем действии), "
+        "затем заново пройди онбординг через /start.",
+    )
 
 
 # ─── Шаговые хэндлеры админа ─────────────────
