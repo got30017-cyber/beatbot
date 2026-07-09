@@ -625,15 +625,18 @@ def handle_admin_actions(call):
                 "Нет открытого набора. Слот создаётся автоматически, когда первый бит попадает в набор.",
             )
             return
-        ok, result = battles.start_slot(slot["id"])
-        if ok:
-            bot.send_message(call.message.chat.id, f"✅ Слот запущен. Создано батлов: {len(result)}")
-        else:
-            bot.send_message(
-                call.message.chat.id,
-                f"⚠️ Недостаточно битов для старта (нужно ≥ 2). "
-                f"Сейчас в наборе: {len(slot['registered_beats'])}.",
-            )
+        try:
+            ok, result = battles.start_slot(slot["id"])
+            if ok:
+                bot.send_message(call.message.chat.id, f"✅ Слот запущен. Создано батлов: {len(result)}")
+            else:
+                bot.send_message(
+                    call.message.chat.id,
+                    f"⚠️ Недостаточно битов для старта (нужно ≥ 2). "
+                    f"Сейчас в наборе: {len(slot['registered_beats'])}.",
+                )
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"⚠️ Ошибка при запуске слота:\n{type(e).__name__}: {e}")
 
     elif call.data == "admin_finish_slot":
         bot.answer_callback_query(call.id)
@@ -662,8 +665,11 @@ def handle_admin_actions(call):
             scheduler.remove_job(f"slot_{slot['id']}")
         except Exception:
             pass
-        battles.finish_slot(slot["id"])
-        bot.send_message(call.message.chat.id, "🛑 Слот завершён досрочно.")
+        try:
+            battles.finish_slot(slot["id"])
+            bot.send_message(call.message.chat.id, "🛑 Слот завершён досрочно.")
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"⚠️ Ошибка при завершении слота:\n{type(e).__name__}: {e}")
 
     elif call.data == "admin_stop_final":
         finals_data = load_finals()
@@ -700,7 +706,10 @@ def handle_admin_actions(call):
 
     elif call.data == "admin_test_users":
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, _create_test_users())
+        try:
+            bot.send_message(call.message.chat.id, _create_test_users())
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"⚠️ Ошибка при создании тест-юзеров:\n{type(e).__name__}: {e}")
 
     elif call.data == "admin_reset_test":
         markup = telebot.types.InlineKeyboardMarkup()
@@ -716,12 +725,15 @@ def handle_admin_actions(call):
 
     elif call.data == "admin_confirm_reset_test":
         bot.edit_message_text("⏳ Чищу тестовые данные...", call.message.chat.id, call.message.message_id)
-        result = reset_test_data()
-        bot.send_message(
-            call.message.chat.id,
-            f"🧹 Удалено: юзеров {result['users']}, битов {result['beats']}, "
-            f"батлов {result['battles']}, слотов {result['slots']}.",
-        )
+        try:
+            result = reset_test_data()
+            bot.send_message(
+                call.message.chat.id,
+                f"🧹 Удалено: юзеров {result['users']}, битов {result['beats']}, "
+                f"батлов {result['battles']}, слотов {result['slots']}.",
+            )
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"⚠️ Ошибка при сбросе тестовых данных:\n{type(e).__name__}: {e}")
 
     elif call.data == "admin_stats":
         bot.answer_callback_query(call.id)

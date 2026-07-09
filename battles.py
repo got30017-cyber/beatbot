@@ -155,6 +155,17 @@ def has_any_votable_battle(user_id: str) -> bool:
     return False
 
 
+def system_has_active_battles() -> bool:
+    """True, если в системе есть хотя бы один активный батл — независимо от
+    того, голосовал ли конкретный пользователь. Используется для бутстрапа
+    билета: бесплатный проход бита даётся ТОЛЬКО когда активных батлов нет
+    вообще (система реально пуста, оценивать физически нечего). Отличие от
+    has_any_votable_battle: та смотрит 'есть ли для МЕНЯ неоценённый батл',
+    что ошибочно срабатывает, когда юзер оценил все батлы."""
+    battles_data = load_battles()
+    return any(b.get("status") == "active" for b in battles_data.values())
+
+
 def votes_needed(user_id: str):
     eligible = get_eligible_battles(user_id)
     users    = load_users()
@@ -1237,6 +1248,17 @@ def start_slot(slot_id: str):
     battles_data = load_battles()
     today        = datetime.now().date().isoformat()
 
+    # MAX+1, а не COUNT+1/len+1 — устойчиво к удалениям (например, кнопкой
+    # «Сбросить тестовые данные») и к нескольким парам за один вызов: len()
+    # растёт только после save_battles(), а new_battle_n инкрементится
+    # локально на каждую пару этого цикла, поэтому коллизий внутри одного
+    # start_slot тоже не будет.
+    existing_nums = [
+        int(k[len("battle_"):]) for k in battles_data
+        if k.startswith("battle_") and k[len("battle_"):].isdigit()
+    ]
+    next_battle_n = (max(existing_nums) + 1) if existing_nums else 1
+
     remaining           = list(beats)
     created_battle_ids  = []
     battle_participants = []   # [(bid, p1_id, p2_id), ...] — для пушей после сохранения
@@ -1248,7 +1270,8 @@ def start_slot(slot_id: str):
         remaining.remove(opponent_beat)
 
         p1_id, p2_id = beat["author_id"], opponent_id
-        bid          = f"battle_{len(battles_data) + 1}"
+        bid          = f"battle_{next_battle_n}"
+        next_battle_n += 1
         start_time   = datetime.now()
 
         battles_data[bid] = {
@@ -1471,11 +1494,13 @@ def _send_beat(message):
         )
         return
 
-    # Bootstrap: если оценивать физически нечего (нет ни одного активного
-    # батла, доступного этому пользователю), билет не запрашиваем вообще —
-    # не start_ticket/не consume_ticket, билет остаётся неактивным, как будто
-    # его никто не начинал платить. Пересчитывается при каждом входе, не флаг.
-    if not has_any_votable_battle(user_id):
+    # Bootstrap: если в системе физически нет ни одного активного батла (а не
+    # просто "нечего оценить лично этому юзеру" — has_any_votable_battle тут
+    # не подходит, она ложно срабатывает, если юзер уже оценил все доступные
+    # батлы), билет не запрашиваем вообще — не start_ticket/не consume_ticket,
+    # билет остаётся неактивным, как будто его никто не начинал платить.
+    # Пересчитывается при каждом входе, не флаг.
+    if not system_has_active_battles():
         vote_context[f"room_{user_id}"] = ROOMS[0]
         _bot.send_message(
             message.chat.id,
@@ -1685,11 +1710,14 @@ def _receive_beat(message):
         )
         return
 
-    if not has_any_votable_battle(user_id):
-        # Бутстрап: система пуста, оценивать нечего — билет не требуется для
-        # этого входа, независимо от того, начинал ли пользователь его когда-то
-        # платить. Ничего не "потребляем" — просто идём дальше по обычному
-        # флоу приёма бита, как если бы билет был не нужен вовсе.
+    if not system_has_active_battles():
+        # Бутстрап: в системе физически нет ни одного активного батла —
+        # билет не требуется для этого входа, независимо от того, начинал ли
+        # пользователь его когда-то платить. has_any_votable_battle тут не
+        # подходит: она ложно сработала бы, если юзер уже оценил все
+        # доступные батлы (а не когда их нет вообще). Ничего не "потребляем" —
+        # просто идём дальше по обычному флоу приёма бита, как если бы билет
+        # был не нужен вовсе.
         pass
     else:
         status = ticket_status(user_id)

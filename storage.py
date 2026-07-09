@@ -29,6 +29,23 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _next_numeric_id(conn, table: str, prefix: str) -> str:
+    """Следующий ID вида '{prefix}_{N}', где N = max существующий суффикс + 1.
+    Устойчив к удалениям (в отличие от COUNT+1): не переиспользует освободившиеся
+    номера, поэтому не может коллизировать с оставшимися строками.
+    id хранится как '{prefix}_{число}'; берём максимум числовой части."""
+    rows = conn.execute(f"SELECT id FROM {table}").fetchall()
+    max_n = 0
+    plen = len(prefix) + 1  # +1 за подчёркивание
+    for r in rows:
+        suffix = r["id"][plen:]
+        if suffix.isdigit():
+            n = int(suffix)
+            if n > max_n:
+                max_n = n
+    return f"{prefix}_{max_n + 1}"
+
+
 def _ensure_user_columns(conn: sqlite3.Connection):
     """Добавляет новые колонки users в БД, созданную до их появления."""
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -545,8 +562,7 @@ def create_beat(author_id: str, file_id: str) -> str:
     conn = _connect()
     try:
         with conn:
-            c = conn.execute("SELECT COUNT(*) AS c FROM beats").fetchone()["c"]
-            beat_id = f"beat_{c + 1}"
+            beat_id = _next_numeric_id(conn, "beats", "beat")
             week_row = conn.execute(
                 "SELECT id FROM weeks WHERE status IN ('running', 'voting') "
                 "ORDER BY started_at DESC LIMIT 1"
@@ -726,8 +742,7 @@ def create_week(started_at: str, closes_at: str) -> str:
     conn = _connect()
     try:
         with conn:
-            c = conn.execute("SELECT COUNT(*) AS c FROM weeks").fetchone()["c"]
-            week_id = f"week_{c + 1}"
+            week_id = _next_numeric_id(conn, "weeks", "week")
             conn.execute(
                 "INSERT INTO weeks (id, status, started_at, closes_at) VALUES (?, 'running', ?, ?)",
                 (week_id, started_at, closes_at),
@@ -810,8 +825,7 @@ def create_slot() -> str:
     conn = _connect()
     try:
         with conn:
-            c = conn.execute("SELECT COUNT(*) AS c FROM slots").fetchone()["c"]
-            slot_id = f"slot_{c + 1}"
+            slot_id = _next_numeric_id(conn, "slots", "slot")
             conn.execute(
                 "INSERT INTO slots (id, status, created_at) VALUES (?, 'registration', ?)",
                 (slot_id, datetime.now().isoformat()),
