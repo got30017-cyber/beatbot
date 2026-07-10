@@ -658,6 +658,16 @@ def _force_finish_battle(bid: str, winning_side: int):
 
 # ─── Решение автора о карьере бита ────────────
 
+def _return_beat_to_registration(beat_id: str):
+    """Возвращает бит в набор открытого registration-слота и переводит в queued.
+    Общий путь для: продолжения карьеры (после оплаты билета ИЛИ бесплатно при
+    пустой системе) и возврата паузного бита."""
+    slot_id = ensure_registration_slot()
+    register_beat_to_slot(slot_id, beat_id)
+    update_beat_status(beat_id, "queued")
+    return slot_id
+
+
 def _maybe_resume_career(user_id: str, chat_id):
     """После оплаты билета продолжения — если у автора есть бит в
     awaiting_decision, автоматически возвращает его в набор слота."""
@@ -669,9 +679,7 @@ def _maybe_resume_career(user_id: str, chat_id):
     if not beat or beat["status"] != "awaiting_decision":
         return
 
-    slot_id = ensure_registration_slot()
-    register_beat_to_slot(slot_id, beat["id"])
-    update_beat_status(beat["id"], "queued")
+    _return_beat_to_registration(beat["id"])
     consume_ticket(user_id)
 
     try:
@@ -695,6 +703,18 @@ def _handle_career_continue(call):
     except Exception:
         pass
 
+    # Бутстрап: если оценивать физически нечего (нет активных батлов),
+    # продолжение бесплатно — бит сразу возвращается в набор, без билета.
+    # Та же логика, что в _send_beat для первого бита.
+    if not system_has_active_battles():
+        _return_beat_to_registration(beat_id)
+        _bot.send_message(
+            call.message.chat.id,
+            "🎧 Сейчас оценивать нечего — твой бит сразу вернулся в набор. Продолжаем карьеру! ▶️",
+        )
+        return
+
+    # Обычный путь: активируем билет продолжения.
     users = load_users()
     discount_applied = 0
     if user_id in users and users[user_id].get("ticket_required", 0) == 0:
@@ -1647,9 +1667,7 @@ def _handle_resume_paused(call):
         _bot.answer_callback_query(call.id, "Нечего возвращать.")
         return
 
-    slot_id = ensure_registration_slot()
-    register_beat_to_slot(slot_id, beat["id"])
-    update_beat_status(beat["id"], "queued")
+    _return_beat_to_registration(beat["id"])
 
     _bot.answer_callback_query(call.id, "Бит возвращён в набор.")
     try:
