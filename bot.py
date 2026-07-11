@@ -618,6 +618,7 @@ def admin_panel(message):
         telebot.types.InlineKeyboardButton("🛑 Завершить слот сейчас",  callback_data="admin_finish_slot"),
         telebot.types.InlineKeyboardButton("🏆 Остановить финал",       callback_data="admin_stop_final"),
         telebot.types.InlineKeyboardButton("👤 Тест-пользователи",      callback_data="admin_test_users"),
+        telebot.types.InlineKeyboardButton("🔄 Продолжить тест-биты",   callback_data="admin_resume_test_beats"),
         telebot.types.InlineKeyboardButton("🧹 Сбросить тестовые данные", callback_data="admin_reset_test"),
         telebot.types.InlineKeyboardButton("📊 Статистика",             callback_data="admin_stats"),
         telebot.types.InlineKeyboardButton("⏱ Время батлов",            callback_data="admin_set_time"),
@@ -728,6 +729,20 @@ def handle_admin_actions(call):
             bot.send_message(call.message.chat.id, _create_test_users())
         except Exception as e:
             bot.send_message(call.message.chat.id, f"⚠️ Ошибка при создании тест-юзеров:\n{type(e).__name__}: {e}")
+
+    elif call.data == "admin_resume_test_beats":
+        bot.answer_callback_query(call.id)
+        try:
+            count = _resume_test_beats()
+            bot.send_message(
+                call.message.chat.id,
+                f"🔄 Возвращено в набор тест-битов: {count}.\n\n"
+                f"Теперь можешь запустить слот заново — ▶️ Запустить слот."
+                if count else
+                "Нет тест-битов, ожидающих продолжения (в статусе awaiting_decision).",
+            )
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"⚠️ Ошибка: {type(e).__name__}: {e}")
 
     elif call.data == "admin_reset_test":
         markup = telebot.types.InlineKeyboardMarkup()
@@ -1034,6 +1049,26 @@ def _create_test_users() -> str:
         lines.append(f"✅ Тестовых карьер завершено (квалификация для Бита недели): {finished_test_beats}")
     lines.append("\nТеперь нажми ▶️ Запустить слот в админке, чтобы разбить набор на пары.")
     return "\n".join(lines)
+
+
+def _resume_test_beats() -> int:
+    """Возвращает в набор все тест-биты (авторы test_*/testq_*), застрявшие
+    в awaiting_decision — боты-тест-юзеры не могут сами нажать «Продолжить
+    карьеру». Эмулирует продолжение, переиспользуя battles._return_beat_to_registration.
+
+    Только awaiting_decision: биты, достигшие MAX_CAREER_BATTLES, уже
+    career_finished и в набор не возвращаются (карьера окончена) — это
+    корректно, их продолжать не нужно."""
+    users    = load_users()
+    test_ids = {uid for uid in users if uid.startswith("test")}
+    count    = 0
+    for uid in test_ids:
+        # у тест-юзера может быть активный бит; берём его и проверяем статус
+        beat = find_active_beat_by_user(uid)
+        if beat and beat["status"] == "awaiting_decision":
+            battles._return_beat_to_registration(beat["id"])
+            count += 1
+    return count
 
 
 # ─── Восстановление таймеров ──────────────────
